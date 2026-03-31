@@ -1,0 +1,9 @@
+ollama
+pyserial
+gTTS
+pygame
+SpeechRecognition
+wit
+torch
+transformers
+numpy
