@@ -1,2 +1,0 @@
-# RoboticCompanion
-For Students
