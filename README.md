@@ -1,6 +1,5 @@
 # 🤖 Robotic Companion with Personality
 
-// Private_Key = export WIT_AI_KEY="32MFBHMM4NXGN6IJUY4PLCBWLIDUPCTI" <- For Personal Use and Reference
 
 A voice-interactive **robotic companion for children** that responds with **speech, emotion, and gestures**, combining **rule-based logic** with **local AI reasoning** — fully offline and privacy-friendly.
 
