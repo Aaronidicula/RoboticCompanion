@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Robotic Companion - Text Input Mode
+Robotic Companion - TinyLlama / robo-fast
+Raspberry Pi → Arduino Uno R4 via USB serial
 - Dynamic persistent memory with deque
-- Mic/STT paused - will restore when MAX9814 hardware arrives
+- Voice STT (microphone, restore when hardware arrives)
+- gTTS + pygame audio output
+- Arduino controls: head nod, left arm, right arm, LCD
 """
 
 import re
@@ -21,28 +24,46 @@ os.environ['AUDIODEV']        = 'hw:2,0'
 
 # ── CONFIG ───────────────────────────────────────────
 MODEL_NAME   = "robo-fast"
-SERIAL_PORT  = "/dev/ttyUSB0"
-SERIAL_BAUD  = 115200
+SERIAL_BAUD  = 9600          # Must match Serial.begin() in Arduino sketch
 MEMORY_LIMIT = 50
 MEMORY_FILE  = os.path.expanduser("~/RoboticCompanion/memory.json")
 
-# ── INIT ─────────────────────────────────────────────
+# ── AUDIO INIT ───────────────────────────────────────
 pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
 print("✅ Audio ready")
 
-ser = None
-try:
-    ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-    time.sleep(2)
-    print(f"✅ ESP32 on {SERIAL_PORT}")
-except Exception as e:
-    print(f"⚠️  No ESP32 ({e}) — continuing without hardware")
+# ── ARDUINO INIT ─────────────────────────────────────
+arduino = None
 
+def connect_arduino():
+    """Try common USB serial ports to find the Arduino Uno R4."""
+    global arduino
+    ports_to_try = [
+        "/dev/ttyACM0",
+        "/dev/ttyACM1",
+        "/dev/ttyUSB0",
+        "/dev/ttyUSB1",
+    ]
+    for port in ports_to_try:
+        try:
+            arduino = serial.Serial(port, SERIAL_BAUD, timeout=1)
+            time.sleep(2)   # Wait for Arduino reset after USB connect
+            print(f"✅ Arduino Uno R4 connected on {port}")
+            return
+        except Exception as e:
+            print(f"   {port}: {e}")
+    print("⚠️  No Arduino found — continuing without hardware")
+
+connect_arduino()
+
+# ── MODEL INIT ───────────────────────────────────────
 print("⏳ Warming up model...")
 try:
-    ollama.chat(model=MODEL_NAME,
-                messages=[{'role': 'user', 'content': 'hi'}],
-                options={'num_predict': 5})
+    ollama.chat(
+        model=MODEL_NAME,
+        messages=[{'role': 'user', 'content': 'hi'}],
+        options={'num_predict': 5}
+    )
     print("✅ Model ready")
 except Exception as e:
     print(f"❌ Model error: {e}")
@@ -55,7 +76,6 @@ topic_memory = deque(maxlen=MEMORY_LIMIT)
 last_topic   = {"keyword": None, "reply": None, "subject": None}
 
 def memory_load():
-    """Load memory from JSON file on startup."""
     global topic_memory
     try:
         if os.path.exists(MEMORY_FILE):
@@ -71,7 +91,6 @@ def memory_load():
         topic_memory = deque(maxlen=MEMORY_LIMIT)
 
 def memory_save_file():
-    """Save memory to JSON file."""
     try:
         os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
         with open(MEMORY_FILE, 'w') as f:
@@ -80,56 +99,58 @@ def memory_save_file():
         print(f"⚠️  Memory save error: {e}")
 
 def memory_save(subject: str, reply: str):
-    """Save a subject+reply pair. Update if subject already exists."""
     if not subject or not reply:
         return
     subject = subject.lower().strip()
-    # Update existing entry if subject already in memory
     for entry in topic_memory:
         if entry["subject"] == subject:
             entry["reply"] = reply
             memory_save_file()
             return
-    # Add new — deque auto-pops oldest when limit exceeded
     topic_memory.append({"subject": subject, "reply": reply})
     memory_save_file()
     print(f"   [memory: saved '{subject}' | total: {len(topic_memory)}/{MEMORY_LIMIT}]")
 
 def memory_lookup(subject: str) -> str | None:
-    """Look up a subject in memory. Returns reply if found."""
     if not subject:
         return None
     subject = subject.lower().strip()
-    # Exact match first
     for entry in topic_memory:
         if entry["subject"] == subject:
             return entry["reply"]
-    # Partial match
     for entry in topic_memory:
         if subject in entry["subject"] or entry["subject"] in subject:
             return entry["reply"]
     return None
 
 def memory_status() -> str:
-    """Show what is currently in memory."""
     if not topic_memory:
         return "Memory is empty"
     subjects = [e["subject"] for e in topic_memory]
     return f"Memory ({len(topic_memory)}/{MEMORY_LIMIT}): {', '.join(subjects)}"
 
-# Load memory on startup
 memory_load()
 
-# ── ESP32 ─────────────────────────────────────────────
-def send_to_esp32(word: str):
-    if ser and ser.is_open:
+# ── ARDUINO SERIAL ───────────────────────────────────
+def send_to_arduino(command: str):
+    """
+    Send a one-word emotion or gesture command to Arduino via USB serial.
+    Supported commands: happy, excited, calm, neutral, concerned,
+                        nod, wave, shake, point, cheer, idle
+    """
+    global arduino
+    if arduino and arduino.is_open:
         try:
-            ser.write(f"{word}\n".encode())
-            print(f"   → ESP32: {word}")
-        except Exception as e:
-            print(f"Serial error: {e}")
+            arduino.write(f"{command}\n".encode())
+            print(f"   → Arduino: {command}")
+        except serial.SerialException as e:
+            print(f"   Serial error: {e} — attempting reconnect...")
+            arduino = None
+            connect_arduino()
+    else:
+        print(f"   [no Arduino] command: {command}")
 
-# ── AUDIO ─────────────────────────────────────────────
+# ── AUDIO OUTPUT ─────────────────────────────────────
 def speak_text(text: str):
     try:
         tts = gTTS(text=text, lang='en', slow=False)
@@ -149,14 +170,17 @@ def speak_text(text: str):
         print(f"TTS error: {e}")
 
 # ── FORMAT HELPER ─────────────────────────────────────
-def format_response(reply, emotion, gesture, source):
-    return {"reply": reply.strip(), "emotion": emotion,
-            "gesture": gesture, "source": source}
+def format_response(reply: str, emotion: str, gesture: str, source: str) -> dict:
+    return {
+        "reply":   reply.strip(),
+        "emotion": emotion,
+        "gesture": gesture,
+        "source":  source
+    }
 
 # ── SUBJECT EXTRACTOR ─────────────────────────────────
 def extract_subject(text: str) -> str | None:
     t = text.lower().strip()
-
     patterns = [
         r'what (?:is|are|was|were) (?:a |an |the )?(.+?)[\?]*$',
         r'tell me (?:about |more about )?(?:a |an |the )?(.+?)[\?]*$',
@@ -167,7 +191,6 @@ def extract_subject(text: str) -> str | None:
         r'(?:tell|show|teach) me (?:a |an |the )?(.+?)[\?]*$',
         r'(?:what|how) about (?:a |an |the )?(.+?)[\?]*$',
     ]
-
     for pattern in patterns:
         match = re.search(pattern, t)
         if match:
@@ -176,30 +199,37 @@ def extract_subject(text: str) -> str | None:
             subject = re.sub(r'\s*(please|now|today)\s*$', '', subject).strip()
             if len(subject) >= 2:
                 return subject
-
-    # Fallback — last meaningful content word
     words = re.sub(r'[^\w\s]', '', t).split()
-    stopwords = {"what", "is", "are", "a", "an", "the", "tell", "me",
-                 "about", "how", "does", "do", "who", "was", "were",
-                 "explain", "more", "hi", "hey", "hello"}
+    stopwords = {
+        "what", "is", "are", "a", "an", "the", "tell", "me",
+        "about", "how", "does", "do", "who", "was", "were",
+        "explain", "more", "hi", "hey", "hello"
+    }
     content_words = [w for w in words if w not in stopwords]
     if content_words:
         return content_words[-1]
-
     return None
 
 # ── RULE ENGINE ───────────────────────────────────────
 def rule_engine(text: str) -> dict | None:
     t = text.lower().strip()
 
-    greetings = {"hi", "hello", "hey", "hiya", "howdy",
-                 "good morning", "good afternoon", "good evening"}
-    farewells  = {"bye", "goodbye", "see you", "see ya",
-                  "goodnight", "good night"}
-    identity   = {"what is your name", "who are you", "your name",
-                  "what are you", "are you a robot"}
-    howru      = {"how are you", "how are you doing",
-                  "are you ok", "how do you feel"}
+    greetings = {
+        "hi", "hello", "hey", "hiya", "howdy",
+        "good morning", "good afternoon", "good evening"
+    }
+    farewells = {
+        "bye", "goodbye", "see you", "see ya",
+        "goodnight", "good night"
+    }
+    identity = {
+        "what is your name", "who are you", "your name",
+        "what are you", "are you a robot"
+    }
+    howru = {
+        "how are you", "how are you doing",
+        "are you ok", "how do you feel"
+    }
 
     if any(g in t for g in greetings):
         return format_response(
@@ -217,7 +247,6 @@ def rule_engine(text: str) -> dict | None:
         return format_response(
             "I am great thank you! I love talking to you!",
             "happy", "nod", "rule")
-
     return None
 
 # ── MATH HANDLER ──────────────────────────────────────
@@ -230,230 +259,129 @@ def simple_math_router(text: str) -> str | None:
 def safe_solve_math(expr: str) -> dict | None:
     try:
         result = eval(expr, {"__builtins__": {}}, {})
-        readable = (expr.replace("*", " times ")
-                       .replace("/", " divided by ")
-                       .replace("+", " plus ")
-                       .replace("-", " minus "))
+        readable = (
+            expr.replace("*", " times ")
+                .replace("/", " divided by ")
+                .replace("+", " plus ")
+                .replace("-", " minus ")
+        )
         return format_response(
             f"{readable} equals {result}!",
-            "happy", "nod", "rule")
+            "happy", "nod", "rule"
+        )
     except Exception:
         return None
 
 # ── STATIC TOPICS ─────────────────────────────────────
 TOPICS = {
-    # Phrases first (longest = most specific)
-    "how to make":      ("You can make things by learning, practising, and asking grown ups to help!",
-                         "happy", "nod"),
-    "how do you make":  ("Great question! You learn step by step with help from teachers and grown ups!",
-                         "happy", "nod"),
-    "solar system":     ("Our solar system has one sun, eight planets, and many moons, comets, and asteroids!",
-                         "excited", "nod"),
-    "black hole":       ("A black hole is a place in space where gravity is so strong that nothing can escape it!",
-                         "excited", "nod"),
-
+    # Phrases (longest first for specificity)
+    "how to make":      ("You can make things by learning, practising, and asking grown ups to help!", "happy", "nod"),
+    "how do you make":  ("Great question! You learn step by step with help from teachers and grown ups!", "happy", "nod"),
+    "solar system":     ("Our solar system has one sun, eight planets, and many moons, comets, and asteroids!", "excited", "nod"),
+    "black hole":       ("A black hole is a place in space where gravity is so strong that nothing can escape it!", "excited", "nod"),
     # Shapes
-    "square":           ("A square is a shape with four equal sides and four corners!",
-                         "happy", "nod"),
-    "circle":           ("A circle is a perfectly round shape, like a ball or the sun!",
-                         "happy", "nod"),
-    "triangle":         ("A triangle is a shape with three sides and three corners!",
-                         "happy", "nod"),
-    "rectangle":        ("A rectangle is like a square but two sides are longer!",
-                         "happy", "nod"),
-
+    "square":           ("A square is a shape with four equal sides and four corners!", "happy", "nod"),
+    "circle":           ("A circle is a perfectly round shape, like a ball or the sun!", "happy", "nod"),
+    "triangle":         ("A triangle is a shape with three sides and three corners!", "happy", "nod"),
+    "rectangle":        ("A rectangle is like a square but two sides are longer!", "happy", "nod"),
     # Science
-    "photosynthesis":   ("Plants use sunlight, water, and air to make their own food — that is photosynthesis!",
-                         "happy", "nod"),
-    "lightning":        ("Lightning is a giant spark of electricity that flashes in the sky during storms!",
-                         "excited", "nod"),
-    "thunder":          ("Thunder is the loud sound lightning makes when it heats the air really fast!",
-                         "calm", "nod"),
-    "earthquake":       ("An earthquake is when the ground shakes because the Earth is moving underneath!",
-                         "calm", "nod"),
-    "volcano":          ("A volcano is a mountain that can shoot out hot melted rock called lava!",
-                         "excited", "nod"),
-    "rainbow":          ("A rainbow appears when sunlight shines through raindrops and makes beautiful colors!",
-                         "excited", "nod"),
-    "gravity":          ("Gravity is an invisible force that pulls things down to the ground!",
-                         "happy", "nod"),
-    "mountain":         ("A mountain is a very tall piece of land that rises high above everything around it!",
-                         "excited", "nod"),
-    "desert":           ("A desert is a very dry place that gets very little rain and can be very hot!",
-                         "calm", "nod"),
-    "forest":           ("A forest is a large area full of trees where many animals live!",
-                         "happy", "nod"),
-    "ocean":            ("The ocean is a huge body of salty water that covers most of our planet!",
-                         "excited", "nod"),
-    "river":            ("A river is a long flowing stream of fresh water that travels to the sea!",
-                         "happy", "nod"),
-    "cloud":            ("Clouds are made of tiny water droplets floating high up in the sky!",
-                         "happy", "nod"),
-    "rain":             ("Rain is water that falls from clouds in the sky when they get too full!",
-                         "happy", "nod"),
-    "snow":             ("Snow is frozen water that falls from clouds as tiny white flakes!",
-                         "excited", "nod"),
-    "wind":             ("Wind is moving air — when air flows from one place to another it makes wind!",
-                         "happy", "nod"),
-    "fire":             ("Fire is hot and bright — it gives us light and warmth but we must be careful!",
-                         "calm", "nod"),
-    "water":            ("Water is a clear liquid we drink to stay healthy — it covers most of our planet!",
-                         "happy", "nod"),
-    "ice":              ("Ice is frozen water — water gets so cold it turns solid and hard!",
-                         "happy", "nod"),
-    "air":              ("Air is all around us even though we cannot see it — we breathe it to stay alive!",
-                         "happy", "nod"),
-    "seed":             ("A seed is a tiny thing that grows into a plant when you give it water and sunlight!",
-                         "happy", "nod"),
-    "flower":           ("Flowers are the colorful parts of plants that smell nice and attract bees!",
-                         "happy", "nod"),
-
+    "photosynthesis":   ("Plants use sunlight, water, and air to make their own food — that is photosynthesis!", "happy", "nod"),
+    "lightning":        ("Lightning is a giant spark of electricity that flashes in the sky during storms!", "excited", "nod"),
+    "thunder":          ("Thunder is the loud sound lightning makes when it heats the air really fast!", "calm", "nod"),
+    "earthquake":       ("An earthquake is when the ground shakes because the Earth is moving underneath!", "calm", "nod"),
+    "volcano":          ("A volcano is a mountain that can shoot out hot melted rock called lava!", "excited", "nod"),
+    "rainbow":          ("A rainbow appears when sunlight shines through raindrops and makes beautiful colors!", "excited", "nod"),
+    "gravity":          ("Gravity is an invisible force that pulls things down to the ground!", "happy", "nod"),
+    "mountain":         ("A mountain is a very tall piece of land that rises high above everything around it!", "excited", "nod"),
+    "desert":           ("A desert is a very dry place that gets very little rain and can be very hot!", "calm", "nod"),
+    "forest":           ("A forest is a large area full of trees where many animals live!", "happy", "nod"),
+    "ocean":            ("The ocean is a huge body of salty water that covers most of our planet!", "excited", "nod"),
+    "river":            ("A river is a long flowing stream of fresh water that travels to the sea!", "happy", "nod"),
+    "cloud":            ("Clouds are made of tiny water droplets floating high up in the sky!", "happy", "nod"),
+    "rain":             ("Rain is water that falls from clouds in the sky when they get too full!", "happy", "nod"),
+    "snow":             ("Snow is frozen water that falls from clouds as tiny white flakes!", "excited", "nod"),
+    "wind":             ("Wind is moving air — when air flows from one place to another it makes wind!", "happy", "nod"),
+    "fire":             ("Fire is hot and bright — it gives us light and warmth but we must be careful!", "calm", "nod"),
+    "water":            ("Water is a clear liquid we drink to stay healthy — it covers most of our planet!", "happy", "nod"),
+    "ice":              ("Ice is frozen water — water gets so cold it turns solid and hard!", "happy", "nod"),
+    "air":              ("Air is all around us even though we cannot see it — we breathe it to stay alive!", "happy", "nod"),
+    "seed":             ("A seed is a tiny thing that grows into a plant when you give it water and sunlight!", "happy", "nod"),
+    "flower":           ("Flowers are the colorful parts of plants that smell nice and attract bees!", "happy", "nod"),
     # Space
-    "telescope":        ("A telescope is a tool that makes faraway things like stars look much bigger and closer!",
-                         "happy", "nod"),
-    "asteroid":         ("An asteroid is a large rock that travels through space — millions orbit the sun!",
-                         "excited", "nod"),
-    "comet":            ("A comet is a ball of ice and rock that travels through space with a glowing tail!",
-                         "excited", "nod"),
-    "astronaut":        ("An astronaut is a person who travels into space to explore it!",
-                         "excited", "nod"),
-    "satellite":        ("A satellite is a machine we send into space that goes around the Earth!",
-                         "happy", "nod"),
-    "galaxy":           ("A galaxy is a huge group of billions of stars all held together in space!",
-                         "excited", "nod"),
-    "rocket":           ("A rocket is a very fast machine that can fly all the way into space!",
-                         "excited", "nod"),
-    "neptune":          ("Neptune is the farthest planet from the sun and has the strongest winds in the solar system!",
-                         "excited", "nod"),
-    "uranus":           ("Uranus is a blue green planet that spins on its side unlike all the other planets!",
-                         "excited", "nod"),
-    "saturn":           ("Saturn has beautiful rings around it made of ice and rocks!",
-                         "excited", "nod"),
-    "jupiter":          ("Jupiter is the biggest planet — all other planets could fit inside it!",
-                         "excited", "nod"),
-    "mars":             ("Mars is called the red planet because its soil is red!",
-                         "excited", "nod"),
-    "venus":            ("Venus is the hottest planet even though it is not the closest to the sun!",
-                         "excited", "nod"),
-    "mercury":          ("Mercury is the smallest planet and the closest one to the sun!",
-                         "excited", "nod"),
-    "pluto":            ("Pluto is a small dwarf planet that lives at the very edge of our solar system!",
-                         "excited", "nod"),
-    "planet":           ("A planet is a huge round object that goes around a star. Earth is our planet!",
-                         "excited", "nod"),
-    "earth":            ("Earth is our home planet! It has land, oceans, and air for us to breathe!",
-                         "happy", "nod"),
-    "moon":             ("The moon goes around the Earth and lights up the night sky!",
-                         "excited", "nod"),
-    "star":             ("Stars are huge balls of fire very far away in space — the sun is our closest star!",
-                         "excited", "nod"),
-    "sun":              ("The sun is a giant ball of fire in the sky that gives us light and warmth!",
-                         "excited", "nod"),
-    "dinosaur":         ("Dinosaurs were amazing animals that lived millions of years ago!",
-                         "excited", "nod"),
-
+    "telescope":        ("A telescope is a tool that makes faraway things like stars look much bigger and closer!", "happy", "nod"),
+    "asteroid":         ("An asteroid is a large rock that travels through space — millions orbit the sun!", "excited", "nod"),
+    "comet":            ("A comet is a ball of ice and rock that travels through space with a glowing tail!", "excited", "nod"),
+    "astronaut":        ("An astronaut is a person who travels into space to explore it!", "excited", "nod"),
+    "satellite":        ("A satellite is a machine we send into space that goes around the Earth!", "happy", "nod"),
+    "galaxy":           ("A galaxy is a huge group of billions of stars all held together in space!", "excited", "nod"),
+    "rocket":           ("A rocket is a very fast machine that can fly all the way into space!", "excited", "nod"),
+    "neptune":          ("Neptune is the farthest planet from the sun and has the strongest winds in the solar system!", "excited", "nod"),
+    "uranus":           ("Uranus is a blue green planet that spins on its side unlike all the other planets!", "excited", "nod"),
+    "saturn":           ("Saturn has beautiful rings around it made of ice and rocks!", "excited", "nod"),
+    "jupiter":          ("Jupiter is the biggest planet — all other planets could fit inside it!", "excited", "nod"),
+    "mars":             ("Mars is called the red planet because its soil is red!", "excited", "nod"),
+    "venus":            ("Venus is the hottest planet even though it is not the closest to the sun!", "excited", "nod"),
+    "mercury":          ("Mercury is the smallest planet and the closest one to the sun!", "excited", "nod"),
+    "pluto":            ("Pluto is a small dwarf planet that lives at the very edge of our solar system!", "excited", "nod"),
+    "planet":           ("A planet is a huge round object that goes around a star. Earth is our planet!", "excited", "nod"),
+    "earth":            ("Earth is our home planet! It has land, oceans, and air for us to breathe!", "happy", "nod"),
+    "moon":             ("The moon goes around the Earth and lights up the night sky!", "excited", "nod"),
+    "star":             ("Stars are huge balls of fire very far away in space — the sun is our closest star!", "excited", "nod"),
+    "sun":              ("The sun is a giant ball of fire in the sky that gives us light and warmth!", "excited", "nod"),
+    "dinosaur":         ("Dinosaurs were amazing animals that lived millions of years ago!", "excited", "nod"),
     # Animals
-    "butterfly":        ("Butterflies start as caterpillars and grow wings to become beautiful fliers!",
-                         "excited", "nod"),
-    "elephant":         ("Elephants are the biggest land animals and have a long trunk to pick things up!",
-                         "excited", "nod"),
-    "penguin":          ("Penguins are birds that cannot fly but they are amazing swimmers!",
-                         "excited", "nod"),
-    "tiger":            ("Tigers are big wild cats with orange and black stripes — they are very fast!",
-                         "excited", "nod"),
-    "whale":            ("Whales are the biggest animals on Earth and they live in the ocean!",
-                         "excited", "nod"),
-    "horse":            ("Horses are strong animals that people ride and they love to run fast!",
-                         "excited", "nod"),
-    "snake":            ("Snakes are long animals with no legs that slide along the ground!",
-                         "calm", "nod"),
-    "frog":             ("Frogs start as tadpoles in water and grow legs to jump on land!",
-                         "excited", "nod"),
-    "lion":             ("Lions are called the king of the jungle — they are big strong cats!",
-                         "excited", "nod"),
-    "bird":             ("Birds have wings and feathers and most of them can fly high in the sky!",
-                         "excited", "nod"),
-    "fish":             ("Fish live in water and breathe through gills instead of lungs like us!",
-                         "happy", "nod"),
-    "dog":              ("Dogs are friendly animals that love to play and are great friends to humans!",
-                         "excited", "wave"),
-    "cat":              ("Cats are fluffy animals that love to sleep and purr when they are happy!",
-                         "happy", "nod"),
-    "bee":              ("Bees make honey and help flowers grow by carrying pollen from flower to flower!",
-                         "happy", "nod"),
-
+    "butterfly":        ("Butterflies start as caterpillars and grow wings to become beautiful fliers!", "excited", "nod"),
+    "elephant":         ("Elephants are the biggest land animals and have a long trunk to pick things up!", "excited", "nod"),
+    "penguin":          ("Penguins are birds that cannot fly but they are amazing swimmers!", "excited", "nod"),
+    "tiger":            ("Tigers are big wild cats with orange and black stripes — they are very fast!", "excited", "nod"),
+    "whale":            ("Whales are the biggest animals on Earth and they live in the ocean!", "excited", "nod"),
+    "horse":            ("Horses are strong animals that people ride and they love to run fast!", "excited", "nod"),
+    "snake":            ("Snakes are long animals with no legs that slide along the ground!", "calm", "nod"),
+    "frog":             ("Frogs start as tadpoles in water and grow legs to jump on land!", "excited", "nod"),
+    "lion":             ("Lions are called the king of the jungle — they are big strong cats!", "excited", "nod"),
+    "bird":             ("Birds have wings and feathers and most of them can fly high in the sky!", "excited", "nod"),
+    "fish":             ("Fish live in water and breathe through gills instead of lungs like us!", "happy", "nod"),
+    "dog":              ("Dogs are friendly animals that love to play and are great friends to humans!", "excited", "wave"),
+    "cat":              ("Cats are fluffy animals that love to sleep and purr when they are happy!", "happy", "nod"),
+    "bee":              ("Bees make honey and help flowers grow by carrying pollen from flower to flower!", "happy", "nod"),
     # Human body
-    "brain":            ("Your brain is like a computer in your head that controls everything you do!",
-                         "excited", "nod"),
-    "heart":            ("Your heart pumps blood all around your body to keep you alive and healthy!",
-                         "happy", "nod"),
-    "bone":             ("Bones are the hard parts inside your body that hold you up like a frame!",
-                         "happy", "nod"),
-    "eye":              ("Your eyes let you see all the beautiful colors and shapes in the world!",
-                         "happy", "nod"),
-
+    "brain":            ("Your brain is like a computer in your head that controls everything you do!", "excited", "nod"),
+    "heart":            ("Your heart pumps blood all around your body to keep you alive and healthy!", "happy", "nod"),
+    "bone":             ("Bones are the hard parts inside your body that hold you up like a frame!", "happy", "nod"),
+    "eye":              ("Your eyes let you see all the beautiful colors and shapes in the world!", "happy", "nod"),
     # Math
-    "multiplication":   ("Multiplication is like adding the same number many times really fast!",
-                         "happy", "nod"),
-    "subtraction":      ("Subtraction means taking away a number to get a smaller number!",
-                         "happy", "nod"),
-    "subtract":         ("Subtraction means taking away a number to get a smaller number!",
-                         "happy", "nod"),
-    "multiply":         ("Multiplication is like adding the same number many times really fast!",
-                         "happy", "nod"),
-    "addition":         ("Addition means adding numbers together to get a bigger number!",
-                         "happy", "nod"),
-    "fraction":         ("A fraction is a part of a whole thing, like half a pizza!",
-                         "happy", "nod"),
-    "geometry":         ("Geometry is the study of shapes like circles, squares, and triangles!",
-                         "happy", "nod"),
-    "divide":           ("Division means splitting a number into equal parts!",
-                         "happy", "nod"),
-    "number":           ("Numbers help us count things — one, two, three, all the way to infinity!",
-                         "happy", "nod"),
-    "zero":             ("Zero means nothing at all — it is the smallest whole number!",
-                         "happy", "nod"),
-    "sum":              ("A sum is the answer you get when you add numbers together!",
-                         "happy", "nod"),
-
+    "multiplication":   ("Multiplication is like adding the same number many times really fast!", "happy", "nod"),
+    "subtraction":      ("Subtraction means taking away a number to get a smaller number!", "happy", "nod"),
+    "subtract":         ("Subtraction means taking away a number to get a smaller number!", "happy", "nod"),
+    "multiply":         ("Multiplication is like adding the same number many times really fast!", "happy", "nod"),
+    "addition":         ("Addition means adding numbers together to get a bigger number!", "happy", "nod"),
+    "fraction":         ("A fraction is a part of a whole thing, like half a pizza!", "happy", "nod"),
+    "geometry":         ("Geometry is the study of shapes like circles, squares, and triangles!", "happy", "nod"),
+    "divide":           ("Division means splitting a number into equal parts!", "happy", "nod"),
+    "number":           ("Numbers help us count things — one, two, three, all the way to infinity!", "happy", "nod"),
+    "zero":             ("Zero means nothing at all — it is the smallest whole number!", "happy", "nod"),
+    "sum":              ("A sum is the answer you get when you add numbers together!", "happy", "nod"),
     # Technology
-    "internet":         ("The internet connects computers all over the world so people can share information!",
-                         "happy", "nod"),
-    "computer":         ("A computer is a smart machine that can store and work with lots of information!",
-                         "happy", "nod"),
-    "robot":            ("A robot is a machine that can do jobs — just like me!",
-                         "excited", "wave"),
-
+    "internet":         ("The internet connects computers all over the world so people can share information!", "happy", "nod"),
+    "computer":         ("A computer is a smart machine that can store and work with lots of information!", "happy", "nod"),
+    "robot":            ("A robot is a machine that can do jobs — just like me!", "excited", "wave"),
     # Everyday
-    "exercise":         ("Exercise means moving your body to stay healthy and strong!",
-                         "excited", "wave"),
-    "family":           ("Family are the special people who love and take care of you!",
-                         "happy", "wave"),
-    "friend":           ("Friends are people who care about you and love to spend time with you!",
-                         "happy", "wave"),
-    "sleep":            ("Sleep helps your body and brain rest and grow strong overnight!",
-                         "calm", "nod"),
-    "food":             ("Food gives our body energy to grow, play, and stay healthy!",
-                         "happy", "nod"),
-
+    "exercise":         ("Exercise means moving your body to stay healthy and strong!", "excited", "wave"),
+    "family":           ("Family are the special people who love and take care of you!", "happy", "wave"),
+    "friend":           ("Friends are people who care about you and love to spend time with you!", "happy", "wave"),
+    "sleep":            ("Sleep helps your body and brain rest and grow strong overnight!", "calm", "nod"),
+    "food":             ("Food gives our body energy to grow, play, and stay healthy!", "happy", "nod"),
     # Fun / misc
-    "sunflower":        ("Sunflowers follow the sun across the sky — that is called heliotropism!",
-                         "excited", "nod"),
-    "color":            ("Colors make the world beautiful — red, blue, yellow, green and so many more!",
-                         "excited", "nod"),
-    "music":            ("Music is made of sounds put together to make something beautiful to hear!",
-                         "excited", "wave"),
-    "book":             ("Books are full of amazing stories and facts that take you on adventures!",
-                         "happy", "nod"),
-    "game":             ("Games are fun activities that help you learn and play with friends!",
-                         "excited", "wave"),
-    "school":           ("School is where you learn amazing new things and make great friends!",
-                         "happy", "nod"),
-    "joke":             ("Why did the robot go to school? To improve its byte! Ha ha!",
-                         "excited", "shake"),
+    "sunflower":        ("Sunflowers follow the sun across the sky — that is called heliotropism!", "excited", "nod"),
+    "color":            ("Colors make the world beautiful — red, blue, yellow, green and so many more!", "excited", "nod"),
+    "music":            ("Music is made of sounds put together to make something beautiful to hear!", "excited", "wave"),
+    "book":             ("Books are full of amazing stories and facts that take you on adventures!", "happy", "nod"),
+    "game":             ("Games are fun activities that help you learn and play with friends!", "excited", "wave"),
+    "school":           ("School is where you learn amazing new things and make great friends!", "happy", "nod"),
+    "joke":             ("Why did the robot go to school? To improve its byte! Ha ha!", "excited", "shake"),
 }
 
-# ── STATIC TOPIC EXTRAS ───────────────────────────────
+# ── TOPIC EXTRA FACTS ─────────────────────────────────
 TOPIC_EXTRAS = {
     "square":        "A square has four corners called right angles and all sides are exactly the same length!",
     "circle":        "A circle has no corners — every point on it is the same distance from the center!",
@@ -513,6 +441,7 @@ TOPIC_EXTRAS = {
     "comet":         "Halley's Comet visits our solar system every 75 years — the next visit will be in 2061!",
 }
 
+# ── TOPIC HANDLER ─────────────────────────────────────
 def topic_handler(text: str) -> dict | None:
     t = text.lower()
 
@@ -524,10 +453,9 @@ def topic_handler(text: str) -> dict | None:
         last_topic["reply"]   = cached
         last_topic["subject"] = subject
         print(f"   [memory: hit '{subject}']")
-        return {"reply": cached, "emotion": "happy",
-                "gesture": "nod", "source": "memory"}
+        return {"reply": cached, "emotion": "happy", "gesture": "nod", "source": "memory"}
 
-    # Fall through to static TOPICS
+    # Fall through to static TOPICS (longest keyword first)
     sorted_topics = sorted(TOPICS.items(), key=lambda x: len(x[0]), reverse=True)
     for keyword, (reply, emotion, gesture) in sorted_topics:
         pattern = r'\b' + re.escape(keyword) + r'\b'
@@ -536,8 +464,7 @@ def topic_handler(text: str) -> dict | None:
             last_topic["reply"]   = reply
             last_topic["subject"] = keyword
             memory_save(keyword, reply)
-            return {"reply": reply, "emotion": emotion,
-                    "gesture": gesture, "source": "topic"}
+            return {"reply": reply, "emotion": emotion, "gesture": gesture, "source": "topic"}
     return None
 
 # ── FOLLOW-UP HANDLER ─────────────────────────────────
@@ -576,17 +503,20 @@ def followup_handler(text: str) -> dict | None:
         if cached:
             return format_response(
                 f"I remember — {cached} Want to ask me something new?",
-                "happy", "nod", "followup")
+                "happy", "nod", "followup"
+            )
 
     # Last — repeat last reply
     if last_topic.get("reply"):
         return format_response(
             f"I said: {last_topic['reply']} Ask me something new to learn more!",
-            "happy", "nod", "followup")
+            "happy", "nod", "followup"
+        )
 
     return format_response(
         "Ask me about something and I will remember it for next time!",
-        "happy", "nod", "followup")
+        "happy", "nod", "followup"
+    )
 
 # ── AI FALLBACK ───────────────────────────────────────
 FALLBACKS = [
@@ -613,9 +543,11 @@ def model_response(user_input: str) -> dict:
         answer = resp['message']['content'].strip()
         answer = re.sub(r'[^\x00-\x7F]+', '', answer).strip()
 
-        bad_phrases = ["sure", "i cannot", "as an ai", "i am unable",
-                       "friendly robot", "simple sentence", "without any",
-                       "also known as", "minor planet", "planetoid"]
+        bad_phrases = [
+            "sure", "i cannot", "as an ai", "i am unable",
+            "friendly robot", "simple sentence", "without any",
+            "also known as", "minor planet", "planetoid"
+        ]
         if len(answer) < 10 or any(b in answer.lower() for b in bad_phrases):
             answer = ""
 
@@ -625,7 +557,6 @@ def model_response(user_input: str) -> dict:
 
     final_answer = answer or random.choice(FALLBACKS)
 
-    # Extract subject and save to memory only if model gave real answer
     subject = extract_subject(user_input)
     if subject and answer:
         memory_save(subject, final_answer)
@@ -640,29 +571,29 @@ def model_response(user_input: str) -> dict:
 def process(user_input: str) -> dict:
     t = user_input.lower().strip()
 
-    # Math always first
+    # 1. Math always first
     if math_expr := simple_math_router(user_input):
         return safe_solve_math(math_expr) or model_response(user_input)
 
-    # Follow-up before topic search
+    # 2. Follow-up before topic search
     if followup := followup_handler(user_input):
         return followup
 
-    # Short inputs — greeting before topic
+    # 3. Short inputs — greeting before topic
     if len(t.split()) <= 4:
         if rule := rule_engine(user_input):
             if not topic_handler(user_input):
                 return rule
 
-    # Topic + memory search
+    # 4. Topic + memory search
     if topic := topic_handler(user_input):
         return topic
 
-    # Greeting on longer inputs
+    # 5. Greeting on longer inputs
     if rule := rule_engine(user_input):
         return rule
 
-    # AI only for truly unknown
+    # 6. AI fallback for truly unknown
     start = time.time()
     result = model_response(user_input)
     print(f"   [inference: {time.time() - start:.1f}s]")
@@ -675,19 +606,29 @@ print(f"   {memory_status()}\n")
 while True:
     try:
         user_input = input("You: ").strip()
-        # TODO: swap input() for listen() when mic arrives
+        # TODO: swap input() for listen() when microphone arrives
 
         if not user_input:
             continue
 
-        # Debug command
+        # Debug commands
         if user_input.lower() == "memory":
             print(memory_status())
+            continue
+
+        if user_input.lower() == "test":
+            # Quick hardware test — cycles through all gestures
+            print("🔧 Testing Arduino gestures...")
+            for cmd in ["happy", "excited", "calm", "neutral"]:
+                send_to_arduino(cmd)
+                time.sleep(2)
+            print("🔧 Test complete")
             continue
 
         if user_input.lower() in {"quit", "exit", "q", "bye", "goodbye"}:
             print("👋 Shutting down...")
             speak_text("Goodbye! See you soon!")
+            send_to_arduino("calm")
             break
 
         final = process(user_input)
@@ -696,18 +637,19 @@ while True:
         print(f"   [emotion={final['emotion']} | gesture={final['gesture']} | source={final['source']}]\n")
 
         speak_text(final['reply'])
-        send_to_esp32(final['emotion'])
+        send_to_arduino(final['emotion'])
 
     except KeyboardInterrupt:
         print("\n👋 Shutting down...")
         speak_text("Goodbye!")
+        send_to_arduino("calm")
         break
     except Exception as e:
         print(f"Error: {e}")
         speak_text("Oops! Let us try again.")
 
 # ── CLEANUP ───────────────────────────────────────────
-if ser and ser.is_open:
-    ser.close()
-    print("Serial port closed.")
+if arduino and arduino.is_open:
+    arduino.close()
+    print("Arduino serial closed.")
 pygame.mixer.quit()
