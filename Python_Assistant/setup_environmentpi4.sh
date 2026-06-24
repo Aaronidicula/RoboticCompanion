@@ -39,16 +39,28 @@ echo ""
 
 # ── STEP 2: SWAP (critical for 4GB Pi) ───────────────────
 echo "── Step 2: Swap setup (2GB) ──"
-current_swap=$(grep CONF_SWAPSIZE /etc/dphys-swapfile | cut -d= -f2)
-echo "   Current swap size: ${current_swap}MB"
-if [ "$current_swap" = "2048" ]; then
-    echo "   ✅ Swap already at 2GB, skipping"
+
+# Ensure dphys-swapfile is installed first
+if ! command -v dphys-swapfile &>/dev/null; then
+    echo "   dphys-swapfile not found — installing..."
+    sudo apt-get update -qq
+    sudo apt-get install -y dphys-swapfile
+fi
+
+if [ -f /etc/dphys-swapfile ]; then
+    current_swap=$(grep CONF_SWAPSIZE /etc/dphys-swapfile | cut -d= -f2)
+    echo "   Current swap size: ${current_swap}MB"
+    if [ "$current_swap" = "2048" ]; then
+        echo "   ✅ Swap already at 2GB, skipping"
+    else
+        sudo dphys-swapfile swapoff
+        sudo sed -i 's/CONF_SWAPSIZE=.*/CONF_SWAPSIZE=2048/' /etc/dphys-swapfile
+        sudo dphys-swapfile setup
+        sudo dphys-swapfile swapon
+        echo "   ✅ Swap set to 2GB"
+    fi
 else
-    sudo dphys-swapfile swapoff
-    sudo sed -i 's/CONF_SWAPSIZE=.*/CONF_SWAPSIZE=2048/' /etc/dphys-swapfile
-    sudo dphys-swapfile setup
-    sudo dphys-swapfile swapon
-    echo "   ✅ Swap set to 2GB"
+    echo "   ⚠️  Could not configure swap via dphys-swapfile — skipping (check your OS's swap mechanism manually)"
 fi
 echo ""
 
@@ -65,7 +77,8 @@ sudo apt-get install -y \
     espeak \
     curl \
     git \
-    alsa-utils
+    alsa-utils \
+    dphys-swapfile
 echo "   ✅ System packages installed"
 echo ""
 
