@@ -5,6 +5,17 @@ Robotic Companion - Final Version for Raspberry Pi 4
 - Persistent memory with deque
 - Arduino UNO R4 WiFi serial communication
 - Voice input via MAX9814 → USB audio card
+
+Serial protocol expected by the Arduino sketch:
+  LOADING        -> show loading screen (sent before model warm-up)
+  READY          -> model loaded, switch to active/idle face
+  LISTEN_ON      -> show listening ears overlay
+  LISTEN_OFF     -> hide listening ears overlay
+  SPEAK_START    -> start talking-mouth animation
+  SPEAK_END      -> stop talking-mouth animation
+  happy/excited/calm/neutral/concerned -> bare emotion strings (no prefix!)
+  GESTURE:<name> -> one-off servo gesture
+  END            -> return to rest / neutral on shutdown
 """
 
 import re
@@ -63,7 +74,30 @@ try:
 except Exception as e:
     print(f"⚠️  Arduino not connected: {e} — continuing without hardware")
 
+# ── SERIAL HELPERS ────────────────────────────────────
+# Defined here (right after `ser` is created) so LOADING/READY can be
+# sent during model warm-up below, before the rest of the script loads.
+def serial_send(command: str):
+    if not (ser and ser.is_open):
+        return
+    try:
+        ser.write(f"{command}\n".encode())
+        time.sleep(SERIAL_CMD_DELAY)
+    except Exception as e:
+        print(f"Serial write error: {e}")
+
+def send_to_arduino(emotion: str, gesture: str = None):
+    """Send the bare emotion string the Arduino expects (e.g. 'happy',
+    NOT 'EMOTION:happy') plus an optional one-off gesture."""
+    if not (ser and ser.is_open):
+        return
+    serial_send(emotion)
+    if gesture and gesture not in {"nod", "idle", "cheer"}:
+        serial_send(f"GESTURE:{gesture}")
+    print(f"→ Sent to Arduino: emotion={emotion} gesture={gesture}")
+
 # ── OLLAMA CHECK ──────────────────────────────────────
+serial_send("LOADING")
 print("⏳ Warming up model...")
 try:
     ollama.chat(model=MODEL_NAME,
@@ -73,6 +107,8 @@ try:
 except Exception as e:
     print(f"❌ Ollama error: {e}")
     exit(1)
+
+serial_send("READY")
 
 print("-" * 60)
 
@@ -140,28 +176,6 @@ def memory_status() -> str:
 
 memory_load()
 
-# ── SERIAL HELPERS ────────────────────────────────────
-def serial_send(command: str):
-    if not (ser and ser.is_open):
-        return
-    try:
-        ser.write(f"{command}\n".encode())
-        delay = 0.18 if command.startswith("SPEAK:") else SERIAL_CMD_DELAY
-        time.sleep(delay)
-    except Exception as e:
-        print(f"Serial write error: {e}")
-
-def send_to_arduino(emotion: str, gesture: str = None, speak_text_str: str = None):
-    if not (ser and ser.is_open):
-        return
-    if speak_text_str:
-        clean = re.sub(r'\*+', '', speak_text_str)[:16].strip()
-        serial_send(f"SPEAK:{clean}")
-    serial_send(f"EMOTION:{emotion}")
-    if gesture and gesture not in {"nod", "idle", "cheer"}:
-        serial_send(f"GESTURE:{gesture}")
-    print(f"→ Sent to Arduino: emotion={emotion} gesture={gesture}")
-
 # ── AUDIO ─────────────────────────────────────────────
 def speak_text(text: str):
     try:
@@ -176,6 +190,14 @@ def speak_text(text: str):
         os.system("aplay -D plughw:3,0 /tmp/response_clean.wav 2>/dev/null")
     except Exception as e:
         print(f"TTS error: {e}")
+
+def say(text: str):
+    """Speak text while keeping the Arduino's talking-mouth animation
+    in sync with actual playback (aplay above blocks until done, so
+    SPEAK_END fires right when the audio really finishes)."""
+    serial_send("SPEAK_START")
+    speak_text(text)
+    serial_send("SPEAK_END")
 
 # ── FORMAT HELPER ─────────────────────────────────────
 def format_response(reply, emotion, gesture, source):
@@ -638,19 +660,26 @@ def get_voice_input() -> str:
 
     mic = sr.Microphone(device_index=1, sample_rate=48000)
 
+    # Ears go up right before we actually start capturing audio, and
+    # come back down as soon as capture ends — regardless of whether
+    # it succeeded, timed out, or errored.
+    serial_send("LISTEN_ON")
+    audio = None
     try:
         with mic as source:
             print("🎤 Listening...")
             audio = r.listen(source, timeout=10, phrase_time_limit=8)
-            print("⏳ Processing...")
-
-        text = r.recognize_google(audio)
-        print(f"You said: {text}")
-        return text.strip()
-
     except sr.WaitTimeoutError:
         print("⏱️  No speech detected")
         return ""
+    finally:
+        serial_send("LISTEN_OFF")
+
+    print("⏳ Processing...")
+    try:
+        text = r.recognize_google(audio)
+        print(f"You said: {text}")
+        return text.strip()
     except sr.UnknownValueError:
         print("❓ Could not understand")
         return ""
@@ -673,9 +702,17 @@ while True:
             print(memory_status())
             continue
 
+        if user_input.lower() == "test":
+            if ser and ser.is_open:
+                print("🧪 Running hardware test — all emotions + gestures (nod, wave, shake, cheer, point)...")
+                serial_send("test")
+            else:
+                print("⚠️  No Arduino connected — can't run hardware test")
+            continue
+
         if user_input.lower() in {"quit", "exit", "bye", "goodbye"}:
             print("👋 Shutting down...")
-            speak_text("Goodbye! See you soon!")
+            say("Goodbye! See you soon!")
             serial_send("END")
             break
 
@@ -688,22 +725,21 @@ while True:
 
         send_to_arduino(
             emotion=final['emotion'],
-            gesture=final.get('gesture'),
-            speak_text_str=final['reply']
+            gesture=final.get('gesture')
         )
 
-        speak_text(final['reply'])
+        say(final['reply'])
 
     except KeyboardInterrupt:
         print("\n👋 Shutting down...")
-        speak_text("Goodbye!")
+        say("Goodbye!")
         serial_send("END")
         break
     except Exception as e:
         import traceback
         print(f"Error: {e}")
         traceback.print_exc()
-        speak_text("Oops, let us try again!")
+        say("Oops, let us try again!")
         continue
 
 # ── CLEANUP ───────────────────────────────────────────
