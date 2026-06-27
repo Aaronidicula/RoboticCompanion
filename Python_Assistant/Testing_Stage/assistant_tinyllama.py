@@ -28,7 +28,7 @@ from collections import deque
 
 # ── SUPPRESS JACK + ALSA WARNINGS ────────────────────
 os.environ['JACK_NO_AUDIO_RESERVATION'] = '1'
-os.environ['JACK_START_SERVER'] = '0'
+os.environ['JACK_NO_START_SERVER'] = '1'
 os.environ['AUDIODEV'] = 'hw:3,0'
 
 import ctypes
@@ -305,6 +305,11 @@ TOPICS = {
     "circle":           ("A circle is a perfectly round shape, like a ball or the sun!", "happy", "nod"),
     "triangle":         ("A triangle is a shape with three sides and three corners!", "happy", "nod"),
     "rectangle":        ("A rectangle is like a square but two sides are longer!", "happy", "nod"),
+    "rhombus":          ("A rhombus is a four sided shape where all sides are the same length, but the corners are not square corners!",
+                         "happy", "nod"),
+    "pentagon":         ("A pentagon is a shape with five straight sides and five corners!", "happy", "nod"),
+    "hexagon":          ("A hexagon is a shape with six straight sides — like a honeycomb!", "happy", "nod"),
+    "octagon":          ("An octagon is a shape with eight sides — like a stop sign!", "happy", "nod"),
     "photosynthesis":   ("Plants use sunlight, water, and air to make their own food — that is photosynthesis!",
                          "happy", "nod"),
     "lightning":        ("Lightning is a giant spark of electricity that flashes in the sky during storms!",
@@ -456,6 +461,10 @@ TOPIC_EXTRAS = {
     "circle":        "A circle has no corners — every point on it is the same distance from the center!",
     "triangle":      "There are different kinds of triangles — some have equal sides and some do not!",
     "rectangle":     "A rectangle has four right angle corners just like a square but two sides are longer!",
+    "rhombus":       "A rhombus looks like a square that got pushed sideways into a diamond shape!",
+    "pentagon":      "The Pentagon is also the name of a famous five-sided building in the United States!",
+    "hexagon":       "Bees build honeycomb out of hexagons because that shape fits together perfectly with no gaps!",
+    "octagon":       "Stop signs are shaped like octagons so drivers can recognize them even from the side!",
     "sun":           "The sun is so big that one million Earths could fit inside it!",
     "moon":          "The moon has no air or wind so astronaut footprints are still there today!",
     "star":          "Stars look small because they are very far away — some are even bigger than our sun!",
@@ -651,6 +660,26 @@ def process(user_input: str) -> dict:
     print(f"   [inference: {time.time() - start:.1f}s]")
     return result
 
+# ── MISHEARD WORD CORRECTIONS ─────────────────────────
+# recognize_google() sometimes mishears rare/technical words as unrelated
+# proper nouns when it's uncertain. Add new mappings here as you find them.
+MISHEAR_CORRECTIONS = {
+    "gorakhpur": "rhombus",
+    "bhojpuri":  "rhombus",
+    "rom bus":   "rhombus",
+    "rum bus":   "rhombus",
+    "ron bus":   "rhombus",
+}
+
+def correct_mishears(text: str) -> str:
+    t = text.lower().strip()
+    for wrong, right in MISHEAR_CORRECTIONS.items():
+        if wrong in t:
+            corrected = t.replace(wrong, right)
+            print(f"   [corrected mishear: '{t}' -> '{corrected}']")
+            return corrected
+    return text
+
 # ── VOICE INPUT ───────────────────────────────────────
 def get_voice_input() -> str:
     r = sr.Recognizer()
@@ -677,7 +706,8 @@ def get_voice_input() -> str:
 
     print("⏳ Processing...")
     try:
-        text = r.recognize_google(audio)
+        text = r.recognize_google(audio, language="en-IN")
+        text = correct_mishears(text)
         print(f"You said: {text}")
         return text.strip()
     except sr.UnknownValueError:
