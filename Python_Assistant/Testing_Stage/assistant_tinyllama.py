@@ -41,6 +41,29 @@ asound = ctypes.cdll.LoadLibrary('libasound.so.2')
 asound.snd_lib_error_set_handler(c_error_handler)
 
 import speech_recognition as sr
+import pyaudio
+
+def find_mic_device_index(name_fragment: str = "USB Audio") -> int:
+    """Find the PyAudio device index whose name contains name_fragment.
+    Returns the FIRST input-capable device matching the fragment.
+    Prints all devices so you can see what names are available."""
+    p = pyaudio.PyAudio()
+    found = None
+    print("🎤 Available audio input devices:")
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        if info.get("maxInputChannels", 0) > 0:
+            print(f"   [{i}] {info['name']}")
+            if found is None and name_fragment.lower() in info['name'].lower():
+                found = i
+    p.terminate()
+    if found is None:
+        print(f"⚠️  No input device matching '{name_fragment}' found — falling back to default (index 0)")
+        return 0
+    print(f"✅ Using mic device index {found}")
+    return found
+
+MIC_DEVICE_INDEX = find_mic_device_index("USB Audio")
 import ollama
 import serial
 from gtts import gTTS
@@ -687,7 +710,7 @@ def get_voice_input() -> str:
     r.energy_threshold = 50
     r.pause_threshold = 0.8
 
-    mic = sr.Microphone(device_index=1, sample_rate=48000)
+    mic = sr.Microphone(device_index=MIC_DEVICE_INDEX, sample_rate=48000)
 
     # Ears go up right before we actually start capturing audio, and
     # come back down as soon as capture ends — regardless of whether
