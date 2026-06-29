@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 """
-Robotic Companion - Text Input Mode
-- Dynamic persistent memory with deque
-- Mic/STT paused - will restore when MAX9814 hardware arrives
-- Arduino Uno R4 serial communication with timing fixes
+Robotic Companion - Final Version for Raspberry Pi 4
+- Audio output via USB card (plughw:3,0) → PAM8403 → Speaker
+- Persistent memory with deque
+- Arduino UNO R4 WiFi serial communication
+- Voice input via MAX9814 → USB audio card
+
+Serial protocol expected by the Arduino sketch:
+  LOADING        -> show loading screen (sent before model warm-up)
+  READY          -> model loaded, switch to active/idle face
+  LISTEN_ON      -> show listening ears overlay
+  LISTEN_OFF     -> hide listening ears overlay
+  SPEAK_START    -> start talking-mouth animation
+  SPEAK_END      -> stop talking-mouth animation
+  happy/excited/calm/neutral/concerned -> bare emotion strings (no prefix!)
+  GESTURE:<name> -> one-off servo gesture
+  END            -> return to rest / neutral on shutdown
 """
 
 import re
@@ -11,47 +23,140 @@ import os
 import time
 import random
 import json
+import subprocess
+from collections import deque
+import pishutdown_script
+
+def pi_shutdown():
+    print("Parent Script Triggered Shutdown")
+    pishutdown_script.trigger_system_halt()
+
+# ── SUPPRESS JACK + ALSA WARNINGS ────────────────────
+os.environ['JACK_NO_AUDIO_RESERVATION'] = '1'
+os.environ['JACK_NO_START_SERVER'] = '1'
+os.environ['AUDIODEV'] = 'hw:3,0'
+
+import ctypes
+ERROR_HANDLER_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int,
+                                       ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
+def py_error_handler(filename, line, function, err, fmt):
+    pass
+c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
+asound = ctypes.cdll.LoadLibrary('libasound.so.2')
+asound.snd_lib_error_set_handler(c_error_handler)
+
+import speech_recognition as sr
+import pyaudio
+
+def find_mic_device_index() -> int:
+    """Find PyAudio index by matching the ALSA card number of RoboMic."""
+    # Step 1: find which card number RoboMic is
+    mic_card_num = None
+    try:
+        with open("/proc/asound/cards") as f:
+            for line in f:
+                if "RoboMic" in line:
+                    mic_card_num = int(line.strip().split()[0])
+                    break
+    except Exception as e:
+        print(f"⚠️  Could not read /proc/asound/cards: {e}")
+
+    if mic_card_num is None:
+        print("⚠️  RoboMic not found in /proc/asound/cards — udev rule may not have applied!")
+        return 0
+
+    print(f"   RoboMic = ALSA card {mic_card_num}")
+
+    # Step 2: find the PyAudio device index whose name contains hw:<card_num>
+    p = pyaudio.PyAudio()
+    found = None
+    print("🎤 Available audio input devices:")
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        if info.get("maxInputChannels", 0) > 0:
+            print(f"   [{i}] {info['name']}")
+            if f"hw:{mic_card_num}," in info['name']:
+                found = i
+    p.terminate()
+
+    if found is None:
+        print(f"⚠️  No PyAudio input device found matching hw:{mic_card_num},")
+        return 0
+
+    print(f"✅ Mic device: index {found}  (RoboMic = hw:{mic_card_num},0)")
+    return found
+
+MIC_DEVICE_INDEX = find_mic_device_index()
 import ollama
 import serial
 from gtts import gTTS
-from collections import deque
-import pygame
-
-os.environ['SDL_AUDIODRIVER'] = 'alsa'
-os.environ['AUDIODEV']        = 'hw:2,0'
 
 # ── CONFIG ───────────────────────────────────────────
-MODEL_NAME   = "robo-fast"
-SERIAL_PORT  = "/dev/ttyACM0"
-SERIAL_BAUD  = 9600
-MEMORY_LIMIT = 50
-MEMORY_FILE  = os.path.expanduser("~/RoboticCompanion/memory.json")
+MODEL_NAME       = "robo-fast"
+SERIAL_PORT      = "/dev/ttyACM0"
+SERIAL_BAUD      = 9600
+MEMORY_LIMIT     = 50
+MEMORY_FILE      = os.path.expanduser("~/RoboticCompanion/memory.json")
 SERIAL_CMD_DELAY = 0.08
 
-# ── INIT ─────────────────────────────────────────────
-pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
-print("✅ Audio ready")
+# ── FORCE AUDIO TO 3.5mm JACK ────────────────────────
+print("🔊 Forcing audio output to 3.5mm jack...")
+try:
+    subprocess.run(["amixer", "cset", "numid=3", "1"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("✅ Audio forced to 3.5mm jack")
+except:
+    print("⚠️  Could not force audio output")
 
+print("✅ Audio system ready (USB card → PAM8403 → Speaker)")
+
+# ── SERIAL TO ARDUINO ─────────────────────────────────
 ser = None
 try:
     ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
     time.sleep(2)
     ser.reset_input_buffer()
-    print(f"✅ Arduino R4 on {SERIAL_PORT}")
+    print(f"✅ Arduino UNO R4 connected on {SERIAL_PORT}")
 except Exception as e:
-    print(f"⚠️  No Arduino ({e}) — continuing without hardware")
+    print(f"⚠️  Arduino not connected: {e} — continuing without hardware")
 
+# ── SERIAL HELPERS ────────────────────────────────────
+# Defined here (right after `ser` is created) so LOADING/READY can be
+# sent during model warm-up below, before the rest of the script loads.
+def serial_send(command: str):
+    if not (ser and ser.is_open):
+        return
+    try:
+        ser.write(f"{command}\n".encode())
+        time.sleep(SERIAL_CMD_DELAY)
+    except Exception as e:
+        print(f"Serial write error: {e}")
+
+def send_to_arduino(emotion: str, gesture: str = None):
+    """Send the bare emotion string the Arduino expects (e.g. 'happy',
+    NOT 'EMOTION:happy') plus an optional one-off gesture."""
+    if not (ser and ser.is_open):
+        return
+    serial_send(emotion)
+    if gesture and gesture not in {"nod", "idle", "cheer"}:
+        serial_send(f"GESTURE:{gesture}")
+    print(f"→ Sent to Arduino: emotion={emotion} gesture={gesture}")
+
+# ── OLLAMA CHECK ──────────────────────────────────────
+serial_send("LOADING")
 print("⏳ Warming up model...")
 try:
     ollama.chat(model=MODEL_NAME,
                 messages=[{'role': 'user', 'content': 'hi'}],
                 options={'num_predict': 5})
-    print("✅ Model ready")
+    print("✅ Ollama model ready")
 except Exception as e:
-    print(f"❌ Model error: {e}")
+    print(f"❌ Ollama error: {e}")
     exit(1)
 
-print("-" * 50)
+serial_send("READY")
+
+print("-" * 60)
 
 # ── PERSISTENT MEMORY ────────────────────────────────
 topic_memory = deque(maxlen=MEMORY_LIMIT)
@@ -67,7 +172,7 @@ def memory_load():
             topic_memory = deque(loaded, maxlen=MEMORY_LIMIT)
             print(f"✅ Memory loaded — {len(topic_memory)} topics remembered")
         else:
-            print("ℹ️  No memory file found — starting fresh")
+            print("ℹ️  No memory file — starting fresh")
     except Exception as e:
         print(f"⚠️  Memory load error: {e} — starting fresh")
         topic_memory = deque(maxlen=MEMORY_LIMIT)
@@ -85,7 +190,7 @@ def memory_save(subject: str, reply: str):
         return
     subject = subject.lower().strip()
     for entry in topic_memory:
-        if entry["subject"] == subject:
+        if entry.get("subject") == subject:
             entry["reply"] = reply
             memory_save_file()
             return
@@ -94,60 +199,28 @@ def memory_save(subject: str, reply: str):
     print(f"   [memory: saved '{subject}' | total: {len(topic_memory)}/{MEMORY_LIMIT}]")
 
 def memory_lookup(subject: str) -> str | None:
+    """Look up a subject in memory. Returns reply if found."""
     if not subject:
         return None
     subject = subject.lower().strip()
+    # Exact match first
     for entry in topic_memory:
-        if entry["subject"] == subject:
-            return entry["reply"]
+        if entry.get("subject") == subject:
+            return entry.get("reply")
+    # Partial match
     for entry in topic_memory:
-        if subject in entry["subject"] or entry["subject"] in subject:
-            return entry["reply"]
+        s = entry.get("subject", "")
+        if subject in s or s in subject:
+            return entry.get("reply")
     return None
 
 def memory_status() -> str:
     if not topic_memory:
         return "Memory is empty"
-    subjects = [e["subject"] for e in topic_memory]
+    subjects = [e.get("subject", "?") for e in topic_memory]
     return f"Memory ({len(topic_memory)}/{MEMORY_LIMIT}): {', '.join(subjects)}"
 
 memory_load()
-
-# ── SERIAL HELPERS ────────────────────────────────────
-def serial_send(command: str):
-    if not (ser and ser.is_open):
-        return
-    try:
-        ser.write(f"{command}\n".encode())
-        # SPEAK commands need more time — longer strings
-        delay = 0.15 if command.startswith("SPEAK:") else SERIAL_CMD_DELAY
-        time.sleep(delay)
-        while ser.in_waiting:
-            echo = ser.readline().decode(errors='replace').strip()
-            if echo:
-                print(f"   ← Arduino: {echo}")
-    except Exception as e:
-        print(f"Serial error: {e}")
-
-def send_to_arduino(emotion: str, gesture: str = None, speak_text_str: str = None):
-    if not (ser and ser.is_open):
-        return
-
-    # 1. SPEAK — truncate to exactly 16 chars (LCD line width)
-    if speak_text_str:
-        clean = re.sub(r'\*+', '', speak_text_str)
-        short = clean[:16].strip()
-        serial_send(f"SPEAK:{short}")
-
-    # 2. Emotion
-    serial_send(emotion)
-
-    # 3. Explicit gesture — only for gestures not auto-paired with emotion
-    EMOTION_AUTO_GESTURES = {"nod", "idle", "cheer"}
-    if gesture and gesture not in EMOTION_AUTO_GESTURES:
-        serial_send(f"GESTURE:{gesture}")
-
-    print(f"   → sent: emotion={emotion} gesture={gesture}")
 
 # ── AUDIO ─────────────────────────────────────────────
 def speak_text(text: str):
@@ -156,17 +229,21 @@ def speak_text(text: str):
         tts.save("/tmp/response.mp3")
         os.system(
             "ffmpeg -y -i /tmp/response.mp3 "
-            "-af 'volume=2.0,highpass=f=200,lowpass=f=3000' "
-            "-ar 22050 -ac 1 /tmp/response_clean.wav "
+            "-af 'volume=3.0' "
+            "-ar 48000 -ac 1 /tmp/response_clean.wav "
             "2>/dev/null"
         )
-        pygame.mixer.music.load("/tmp/response_clean.wav")
-        pygame.mixer.music.set_volume(1.0)
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy():
-            pygame.time.Clock().tick(10)
+        os.system("aplay -D plughw:RoboSpk,0 /tmp/response_clean.wav 2>/dev/null")
     except Exception as e:
         print(f"TTS error: {e}")
+
+def say(text: str):
+    """Speak text while keeping the Arduino's talking-mouth animation
+    in sync with actual playback (aplay above blocks until done, so
+    SPEAK_END fires right when the audio really finishes)."""
+    serial_send("SPEAK_START")
+    speak_text(text)
+    serial_send("SPEAK_END")
 
 # ── FORMAT HELPER ─────────────────────────────────────
 def format_response(reply, emotion, gesture, source):
@@ -176,14 +253,8 @@ def format_response(reply, emotion, gesture, source):
 # ── SUBJECT EXTRACTOR ─────────────────────────────────
 def extract_subject(text: str) -> str | None:
     t = text.lower().strip()
-
-    # Reject conversational questions — no real subject to extract
-    conversational = [
-        "can you", "can we", "what can", "what do you",
-        "when are you", "how are you", "will you", "do you",
-        "are you", "what would you", "what should",
-        "help me", "could you", "would you",
-    ]
+    conversational = ["can you", "can we", "what can", "what do you",
+                      "how are you", "are you"]
     if any(t.startswith(c) for c in conversational):
         return None
 
@@ -196,29 +267,23 @@ def extract_subject(text: str) -> str | None:
         r'explain (?:a |an |the )?(.+?)[\?]*$',
         r'(?:tell|show|teach) me (?:a |an |the )?(.+?)[\?]*$',
         r'(?:what|how) about (?:a |an |the )?(.+?)[\?]*$',
-        r'what are (?:some )?(.+?)[\?]*$',
     ]
-
     for pattern in patterns:
         match = re.search(pattern, t)
         if match:
             subject = match.group(1).strip()
             subject = re.sub(r'\?+$', '', subject).strip()
             subject = re.sub(r'\s*(please|now|today)\s*$', '', subject).strip()
-            # Reject if too vague or too long
-            if len(subject) >= 2 and len(subject.split()) <= 4:
+            if len(subject) >= 2:
                 return subject
 
-    # Fallback — only for very short inputs like "pluto?" or "rain?"
     words = re.sub(r'[^\w\s]', '', t).split()
-    if len(words) <= 3:
-        stopwords = {"what", "is", "are", "a", "an", "the", "tell", "me",
-                     "about", "how", "does", "do", "who", "was", "were",
-                     "explain", "more", "hi", "hey", "hello"}
-        content_words = [w for w in words if w not in stopwords]
-        if content_words:
-            return content_words[-1]
-
+    stopwords = {"what", "is", "are", "a", "an", "the", "tell", "me",
+                 "about", "how", "does", "do", "who", "was", "were",
+                 "explain", "more", "hi", "hey", "hello"}
+    content_words = [w for w in words if w not in stopwords]
+    if content_words:
+        return content_words[-1]
     return None
 
 # ── RULE ENGINE ───────────────────────────────────────
@@ -250,7 +315,6 @@ def rule_engine(text: str) -> dict | None:
         return format_response(
             "I am great thank you! I love talking to you!",
             "happy", "nod", "rule")
-
     return None
 
 # ── MATH HANDLER ──────────────────────────────────────
@@ -275,7 +339,6 @@ def safe_solve_math(expr: str) -> dict | None:
 
 # ── STATIC TOPICS ─────────────────────────────────────
 TOPICS = {
-    # Phrases first (longest = most specific)
     "how to make":      ("You can make things by learning, practising, and asking grown ups to help!",
                          "happy", "nod"),
     "how do you make":  ("Great question! You learn step by step with help from teachers and grown ups!",
@@ -284,14 +347,15 @@ TOPICS = {
                          "excited", "nod"),
     "black hole":       ("A black hole is a place in space where gravity is so strong that nothing can escape it!",
                          "excited", "nod"),
-
-    # Shapes
     "square":           ("A square is a shape with four equal sides and four corners!", "happy", "nod"),
     "circle":           ("A circle is a perfectly round shape, like a ball or the sun!", "happy", "nod"),
     "triangle":         ("A triangle is a shape with three sides and three corners!", "happy", "nod"),
     "rectangle":        ("A rectangle is like a square but two sides are longer!", "happy", "nod"),
-
-    # Science
+    "rhombus":          ("A rhombus is a four sided shape where all sides are the same length, but the corners are not square corners!",
+                         "happy", "nod"),
+    "pentagon":         ("A pentagon is a shape with five straight sides and five corners!", "happy", "nod"),
+    "hexagon":          ("A hexagon is a shape with six straight sides — like a honeycomb!", "happy", "nod"),
+    "octagon":          ("An octagon is a shape with eight sides — like a stop sign!", "happy", "nod"),
     "photosynthesis":   ("Plants use sunlight, water, and air to make their own food — that is photosynthesis!",
                          "happy", "nod"),
     "lightning":        ("Lightning is a giant spark of electricity that flashes in the sky during storms!",
@@ -315,7 +379,8 @@ TOPICS = {
     "river":            ("A river is a long flowing stream of fresh water that travels to the sea!",
                          "happy", "nod"),
     "cloud":            ("Clouds are made of tiny water droplets floating high up in the sky!", "happy", "nod"),
-    "rain":             ("Rain is water that falls from clouds in the sky when they get too full!", "happy", "nod"),
+    "rain":             ("Rain is water that falls from clouds in the sky when they get too full!",
+                         "happy", "nod"),
     "snow":             ("Snow is frozen water that falls from clouds as tiny white flakes!", "excited", "nod"),
     "wind":             ("Wind is moving air — when air flows from one place to another it makes wind!",
                          "happy", "nod"),
@@ -330,9 +395,7 @@ TOPICS = {
                          "happy", "nod"),
     "flower":           ("Flowers are the colorful parts of plants that smell nice and attract bees!",
                          "happy", "nod"),
-
-    # Space
-    "telescope":        ("A telescope is a tool that makes faraway things like stars look much bigger and closer!",
+    "telescope":        ("A telescope is a tool that makes faraway things like stars look much bigger!",
                          "happy", "nod"),
     "asteroid":         ("An asteroid is a large rock that travels through space — millions orbit the sun!",
                          "excited", "nod"),
@@ -345,10 +408,9 @@ TOPICS = {
                          "excited", "nod"),
     "rocket":           ("A rocket is a very fast machine that can fly all the way into space!",
                          "excited", "nod"),
-    "neptune":          ("Neptune is the farthest planet from the sun and has the strongest winds in the solar system!",
+    "neptune":          ("Neptune is the farthest planet from the sun and has the strongest winds!",
                          "excited", "nod"),
-    "uranus":           ("Uranus is a blue green planet that spins on its side unlike all the other planets!",
-                         "excited", "nod"),
+    "uranus":           ("Uranus is a blue green planet that spins on its side!", "excited", "nod"),
     "saturn":           ("Saturn has beautiful rings around it made of ice and rocks!", "excited", "nod"),
     "jupiter":          ("Jupiter is the biggest planet — all other planets could fit inside it!",
                          "excited", "nod"),
@@ -356,7 +418,7 @@ TOPICS = {
     "venus":            ("Venus is the hottest planet even though it is not the closest to the sun!",
                          "excited", "nod"),
     "mercury":          ("Mercury is the smallest planet and the closest one to the sun!", "excited", "nod"),
-    "pluto":            ("Pluto is a small dwarf planet that lives at the very edge of our solar system!",
+    "pluto":            ("Pluto is a small dwarf planet at the very edge of our solar system!",
                          "excited", "nod"),
     "planet":           ("A planet is a huge round object that goes around a star. Earth is our planet!",
                          "excited", "nod"),
@@ -368,8 +430,6 @@ TOPICS = {
     "sun":              ("The sun is a giant ball of fire in the sky that gives us light and warmth!",
                          "excited", "nod"),
     "dinosaur":         ("Dinosaurs were amazing animals that lived millions of years ago!", "excited", "nod"),
-
-    # Animals
     "butterfly":        ("Butterflies start as caterpillars and grow wings to become beautiful fliers!",
                          "excited", "nod"),
     "elephant":         ("Elephants are the biggest land animals and have a long trunk to pick things up!",
@@ -384,15 +444,14 @@ TOPICS = {
     "lion":             ("Lions are called the king of the jungle — they are big strong cats!", "excited", "nod"),
     "bird":             ("Birds have wings and feathers and most of them can fly high in the sky!",
                          "excited", "nod"),
-    "fish":             ("Fish live in water and breathe through gills instead of lungs like us!", "happy", "nod"),
+    "fish":             ("Fish live in water and breathe through gills instead of lungs like us!",
+                         "happy", "nod"),
     "dog":              ("Dogs are friendly animals that love to play and are great friends to humans!",
                          "excited", "wave"),
     "cat":              ("Cats are fluffy animals that love to sleep and purr when they are happy!",
                          "happy", "nod"),
     "bee":              ("Bees make honey and help flowers grow by carrying pollen from flower to flower!",
                          "happy", "nod"),
-
-    # Human body
     "brain":            ("Your brain is like a computer in your head that controls everything you do!",
                          "excited", "nod"),
     "heart":            ("Your heart pumps blood all around your body to keep you alive and healthy!",
@@ -401,37 +460,32 @@ TOPICS = {
                          "happy", "nod"),
     "eye":              ("Your eyes let you see all the beautiful colors and shapes in the world!",
                          "happy", "nod"),
-
-    # Math
-    "multiplication":   ("Multiplication is like adding the same number many times really fast!", "happy", "nod"),
+    "multiplication":   ("Multiplication is like adding the same number many times really fast!",
+                         "happy", "nod"),
     "subtraction":      ("Subtraction means taking away a number to get a smaller number!", "happy", "nod"),
     "subtract":         ("Subtraction means taking away a number to get a smaller number!", "happy", "nod"),
-    "multiply":         ("Multiplication is like adding the same number many times really fast!", "happy", "nod"),
+    "multiply":         ("Multiplication is like adding the same number many times really fast!",
+                         "happy", "nod"),
     "addition":         ("Addition means adding numbers together to get a bigger number!", "happy", "nod"),
     "fraction":         ("A fraction is a part of a whole thing, like half a pizza!", "happy", "nod"),
-    "geometry":         ("Geometry is the study of shapes like circles, squares, and triangles!", "happy", "nod"),
+    "geometry":         ("Geometry is the study of shapes like circles, squares, and triangles!",
+                         "happy", "nod"),
     "divide":           ("Division means splitting a number into equal parts!", "happy", "nod"),
     "number":           ("Numbers help us count things — one, two, three, all the way to infinity!",
                          "happy", "nod"),
     "zero":             ("Zero means nothing at all — it is the smallest whole number!", "happy", "nod"),
     "sum":              ("A sum is the answer you get when you add numbers together!", "happy", "nod"),
-
-    # Technology
     "internet":         ("The internet connects computers all over the world so people can share information!",
                          "happy", "nod"),
     "computer":         ("A computer is a smart machine that can store and work with lots of information!",
                          "happy", "nod"),
     "robot":            ("A robot is a machine that can do jobs — just like me!", "excited", "wave"),
-
-    # Everyday
     "exercise":         ("Exercise means moving your body to stay healthy and strong!", "excited", "wave"),
     "family":           ("Family are the special people who love and take care of you!", "happy", "wave"),
     "friend":           ("Friends are people who care about you and love to spend time with you!",
                          "happy", "wave"),
     "sleep":            ("Sleep helps your body and brain rest and grow strong overnight!", "calm", "nod"),
     "food":             ("Food gives our body energy to grow, play, and stay healthy!", "happy", "nod"),
-
-    # Fun / misc
     "sunflower":        ("Sunflowers follow the sun across the sky — that is called heliotropism!",
                          "excited", "nod"),
     "color":            ("Colors make the world beautiful — red, blue, yellow, green and so many more!",
@@ -440,17 +494,23 @@ TOPICS = {
                          "excited", "wave"),
     "book":             ("Books are full of amazing stories and facts that take you on adventures!",
                          "happy", "nod"),
-    "game":             ("Games are fun activities that help you learn and play with friends!", "excited", "wave"),
-    "school":           ("School is where you learn amazing new things and make great friends!", "happy", "nod"),
+    "game":             ("Games are fun activities that help you learn and play with friends!",
+                         "excited", "wave"),
+    "school":           ("School is where you learn amazing new things and make great friends!",
+                         "happy", "nod"),
     "joke":             ("Why did the robot go to school? To improve its byte! Ha ha!", "excited", "shake"),
 }
 
-# ── STATIC TOPIC EXTRAS ───────────────────────────────
+# ── TOPIC EXTRAS ──────────────────────────────────────
 TOPIC_EXTRAS = {
     "square":        "A square has four corners called right angles and all sides are exactly the same length!",
     "circle":        "A circle has no corners — every point on it is the same distance from the center!",
     "triangle":      "There are different kinds of triangles — some have equal sides and some do not!",
     "rectangle":     "A rectangle has four right angle corners just like a square but two sides are longer!",
+    "rhombus":       "A rhombus looks like a square that got pushed sideways into a diamond shape!",
+    "pentagon":      "The Pentagon is also the name of a famous five-sided building in the United States!",
+    "hexagon":       "Bees build honeycomb out of hexagons because that shape fits together perfectly with no gaps!",
+    "octagon":       "Stop signs are shaped like octagons so drivers can recognize them even from the side!",
     "sun":           "The sun is so big that one million Earths could fit inside it!",
     "moon":          "The moon has no air or wind so astronaut footprints are still there today!",
     "star":          "Stars look small because they are very far away — some are even bigger than our sun!",
@@ -462,7 +522,7 @@ TOPIC_EXTRAS = {
     "photosynthesis":"Plants store the food they make in their leaves, stems, and roots!",
     "gravity":       "Gravity keeps us on the ground and keeps the Earth going around the sun!",
     "heart":         "Your heart beats about 100000 times every single day without stopping!",
-    "brain":         "Your brain has about 86 billion tiny cells called neurons that send messages to each other!",
+    "brain":         "Your brain has about 86 billion tiny cells called neurons that send messages!",
     "butterfly":     "A butterfly goes through four stages — egg, caterpillar, cocoon, and then butterfly!",
     "bee":           "A bee visits about 2000 flowers every day to collect nectar to make honey!",
     "elephant":      "Elephants never forget — they have an amazing memory and can remember friends for years!",
@@ -481,7 +541,7 @@ TOPIC_EXTRAS = {
     "music":         "Music can make you feel happy, calm, or excited — it affects your brain in amazing ways!",
     "book":          "Reading books helps your brain grow stronger and learn new words every day!",
     "fish":          "There are more than 30000 different kinds of fish living in oceans and rivers!",
-    "bird":          "Some birds like the Arctic tern fly from one end of the Earth to the other every year!",
+    "bird":          "Some birds fly from one end of the Earth to the other every year!",
     "lion":          "A group of lions is called a pride and they live and hunt together as a family!",
     "whale":         "Blue whales are the largest animals that have ever lived on Earth!",
     "rocket":        "Rockets work by pushing hot gas downward really fast which pushes the rocket upward!",
@@ -498,17 +558,17 @@ TOPIC_EXTRAS = {
     "exercise":      "Just 30 minutes of exercise a day makes your heart, brain, and muscles stronger!",
     "pluto":         "Pluto was called a planet for 76 years but in 2006 scientists reclassified it!",
     "mars":          "Mars has the tallest volcano in the solar system — three times taller than Everest!",
-    "jupiter":       "Jupiter has a giant storm called the Great Red Spot that has been spinning for 300 years!",
+    "jupiter":       "Jupiter has a giant storm called the Great Red Spot spinning for 300 years!",
     "saturn":        "Saturn is so light that if you found a big enough bathtub it would float in water!",
     "solar system":  "Our solar system takes 225 million years for the sun to orbit the Milky Way galaxy!",
-    "black hole":    "The nearest black hole to Earth is about 1000 light years away so we are perfectly safe!",
-    "comet":         "Halley's Comet visits our solar system every 75 years — the next visit will be in 2061!",
+    "black hole":    "The nearest black hole to Earth is about 1000 light years away so we are safe!",
+    "comet":         "Halley's Comet visits our solar system every 75 years — next visit will be in 2061!",
 }
 
+# ── TOPIC HANDLER ─────────────────────────────────────
 def topic_handler(text: str) -> dict | None:
     t = text.lower()
 
-    # Check dynamic memory first
     subject = extract_subject(text) or t
     cached  = memory_lookup(subject)
     if cached:
@@ -519,7 +579,6 @@ def topic_handler(text: str) -> dict | None:
         return {"reply": cached, "emotion": "happy",
                 "gesture": "nod", "source": "memory"}
 
-    # Fall through to static TOPICS
     sorted_topics = sorted(TOPICS.items(), key=lambda x: len(x[0]), reverse=True)
     for keyword, (reply, emotion, gesture) in sorted_topics:
         pattern = r'\b' + re.escape(keyword) + r'\b'
@@ -541,27 +600,23 @@ FOLLOWUP_PHRASES = [
 
 def followup_handler(text: str) -> dict | None:
     t = text.lower().strip()
-
     if not any(phrase in t for phrase in FOLLOWUP_PHRASES):
         return None
 
     keyword = last_topic.get("keyword")
     subject = last_topic.get("subject")
 
-    # Best — static curated extra fact
     if keyword and keyword in TOPIC_EXTRAS:
         extra = TOPIC_EXTRAS[keyword]
         memory_save(f"{keyword} more", extra)
         return format_response(extra, "excited", "nod", "followup")
 
-    # Second — check TOPIC_EXTRAS for extracted subject
     if subject:
         for key in TOPIC_EXTRAS:
             if key in subject or subject in key:
                 extra = TOPIC_EXTRAS[key]
                 return format_response(extra, "excited", "nod", "followup")
 
-    # Third — check dynamic memory
     if subject:
         cached = memory_lookup(subject)
         if cached:
@@ -569,7 +624,6 @@ def followup_handler(text: str) -> dict | None:
                 f"I remember — {cached} Want to ask me something new?",
                 "happy", "nod", "followup")
 
-    # Last — repeat last reply
     if last_topic.get("reply"):
         return format_response(
             f"I said: {last_topic['reply']} Ask me something new to learn more!",
@@ -604,18 +658,10 @@ def model_response(user_input: str) -> dict:
         answer = resp['message']['content'].strip()
         answer = re.sub(r'[^\x00-\x7F]+', '', answer).strip()
 
-        bad_phrases = [
-            "sure", "i cannot", "as an ai", "i am unable",
-            "friendly robot", "simple sentence", "without any",
-            "also known as", "minor planet", "planetoid",
-            "the machine", "the robot replies", "the happy",
-            "cheerful", "enthusiastic", "answers the question",
-            "responds,", "replies,", "of course",
-        ]
-        if (len(answer) < 10
-                or len(answer) > 120
-                or any(b in answer.lower() for b in bad_phrases)
-                or answer.count('"') >= 2):
+        bad_phrases = ["sure", "i cannot", "as an ai", "i am unable",
+                       "friendly robot", "simple sentence", "without any",
+                       "also known as", "minor planet", "planetoid"]
+        if len(answer) < 10 or any(b in answer.lower() for b in bad_phrases):
             answer = ""
 
     except Exception as e:
@@ -624,7 +670,6 @@ def model_response(user_input: str) -> dict:
 
     final_answer = answer or random.choice(FALLBACKS)
 
-    # Only save to memory if model gave a real clean answer
     subject = extract_subject(user_input)
     if subject and answer:
         memory_save(subject, final_answer)
@@ -639,92 +684,143 @@ def model_response(user_input: str) -> dict:
 def process(user_input: str) -> dict:
     t = user_input.lower().strip()
 
-    # Math always first
     if math_expr := simple_math_router(user_input):
         return safe_solve_math(math_expr) or model_response(user_input)
 
-    # Follow-up before topic search
     if followup := followup_handler(user_input):
         return followup
 
-    # Short inputs — greeting before topic
     if len(t.split()) <= 4:
         if rule := rule_engine(user_input):
             if not topic_handler(user_input):
                 return rule
 
-    # Topic + memory search
     if topic := topic_handler(user_input):
         return topic
 
-    # Greeting on longer inputs
     if rule := rule_engine(user_input):
         return rule
 
-    # AI only for truly unknown
     start = time.time()
     result = model_response(user_input)
     print(f"   [inference: {time.time() - start:.1f}s]")
     return result
 
+# ── MISHEARD WORD CORRECTIONS ─────────────────────────
+# recognize_google() sometimes mishears rare/technical words as unrelated
+# proper nouns when it's uncertain. Add new mappings here as you find them.
+MISHEAR_CORRECTIONS = {
+    "gorakhpur": "rhombus",
+    "bhojpuri":  "rhombus",
+    "rom bus":   "rhombus",
+    "rum bus":   "rhombus",
+    "ron bus":   "rhombus",
+}
+
+def correct_mishears(text: str) -> str:
+    t = text.lower().strip()
+    for wrong, right in MISHEAR_CORRECTIONS.items():
+        if wrong in t:
+            corrected = t.replace(wrong, right)
+            print(f"   [corrected mishear: '{t}' -> '{corrected}']")
+            return corrected
+    return text
+
+# ── VOICE INPUT ───────────────────────────────────────
+def get_voice_input() -> str:
+    r = sr.Recognizer()
+    r.dynamic_energy_threshold = False
+    r.energy_threshold = 50
+    r.pause_threshold = 0.8
+
+    mic = sr.Microphone(device_index=MIC_DEVICE_INDEX, sample_rate=48000)
+
+    # Ears go up right before we actually start capturing audio, and
+    # come back down as soon as capture ends — regardless of whether
+    # it succeeded, timed out, or errored.
+    serial_send("LISTEN_ON")
+    audio = None
+    try:
+        with mic as source:
+            print("🎤 Listening...")
+            audio = r.listen(source, timeout=10, phrase_time_limit=8)
+    except sr.WaitTimeoutError:
+        print("⏱️  No speech detected")
+        return ""
+    finally:
+        serial_send("LISTEN_OFF")
+
+    print("⏳ Processing...")
+    try:
+        text = r.recognize_google(audio, language="en-IN")
+        text = correct_mishears(text)
+        print(f"You said: {text}")
+        return text.strip()
+    except sr.UnknownValueError:
+        print("❓ Could not understand")
+        return ""
+    except Exception as e:
+        print(f"🎤 Voice error: {e}")
+        return ""
+
 # ── MAIN LOOP ─────────────────────────────────────────
-print("\n🤖 Robo ready! Type your message. (quit / exit to stop)\n")
+print(f"\n🤖 Robo ready! Speak to me. (say 'quit' or 'bye' to stop)\n")
 print(f"   {memory_status()}\n")
 
 while True:
     try:
-        user_input = input("You: ").strip()
-        # TODO: swap input() for listen() when mic arrives
+        user_input = get_voice_input()
 
         if not user_input:
             continue
 
-        # Hardware test
-        if user_input.lower() == "test":
-            if ser and ser.is_open:
-                serial_send("test")
-                print("   → Arduino: hardware test triggered")
-            else:
-                print("   ⚠️  No Arduino connected")
-            continue
-
-        # Debug — show memory contents
         if user_input.lower() == "memory":
             print(memory_status())
             continue
 
-        if user_input.lower() in {"quit", "exit", "q", "bye", "goodbye"}:
+        if user_input.lower() == "test":
+            if ser and ser.is_open:
+                print("🧪 Running hardware test — all emotions + gestures (nod, wave, shake, cheer, point)...")
+                serial_send("test")
+            else:
+                print("⚠️  No Arduino connected — can't run hardware test")
+            continue
+
+        if user_input.lower() in {"quit", "exit", "bye", "goodbye"}:
             print("👋 Shutting down...")
-            speak_text("Goodbye! See you soon!")
+            say("Goodbye! See you soon!")
             serial_send("END")
-            break
+            if ser and ser.is_open:
+                ser.close()
+            pi_shutdown()
+
+        print(f"You: {user_input}")
 
         final = process(user_input)
 
         print(f"\n🤖 Robo: {final['reply']}")
         print(f"   [emotion={final['emotion']} | gesture={final['gesture']} | source={final['source']}]\n")
 
-        # Send to Arduino BEFORE speaking so LCD updates instantly
         send_to_arduino(
             emotion=final['emotion'],
-            gesture=final.get('gesture'),
-            speak_text_str=final['reply']
+            gesture=final.get('gesture')
         )
 
-        # Speak after Arduino has been updated
-        speak_text(final['reply'])
+        say(final['reply'])
 
     except KeyboardInterrupt:
         print("\n👋 Shutting down...")
-        speak_text("Goodbye!")
+        say("Goodbye!")
         serial_send("END")
         break
     except Exception as e:
+        import traceback
         print(f"Error: {e}")
-        speak_text("Oops! Let us try again.")
+        traceback.print_exc()
+        say("Oops, let us try again!")
+        continue
 
 # ── CLEANUP ───────────────────────────────────────────
 if ser and ser.is_open:
     ser.close()
     print("Serial port closed.")
-pygame.mixer.quit()
