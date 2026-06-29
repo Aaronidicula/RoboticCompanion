@@ -1,213 +1,433 @@
 # 🤖 Robotic Companion with Personality
 
-
 A voice-interactive **robotic companion for children** that responds with **speech, emotion, and gestures**, combining **rule-based logic** with **local AI reasoning** — fully offline and privacy-friendly.
 
-This project integrates:
-- **ESP32 (LCD + Servo + Button)**
-- **Python AI Brain**
-- **Phi-3-mini (via Ollama)**
-- **Speech-to-Text (Wit.ai)**
-- **Text-to-Speech (gTTS)**
+> "A friendly robotic companion for children that listens, thinks, speaks, and reacts with emotion — built entirely with offline AI and affordable hardware."
 
 ---
 
 ## ✨ Key Features
 
-- 🎤 **Voice interaction** (speech recognition)
+- 🎤 **Voice interaction** via MAX9814 microphone
 - 🧠 **Hybrid intelligence**
-  - Rule-based responses for safety & accuracy
-  - AI model fallback for open conversation
-- 😊 **Personality & emotions**
-  - LCD displays emotion
-  - Servo gestures (wave, nod, shake)
-- 🔊 **Speech output**
-- 🔌 **ESP32 hardware integration**
-- 📴 **Offline-first AI**
-  - No paid API required
-  - ChatGPT support optional (future)
-- 🔐 **Privacy-friendly**
-  - Runs locally on your machine
+  - Rule-based responses for safety and accuracy
+  - AI model fallback (Ollama `robo-fast`) for open conversation
+- 😊 **Personality and emotions**
+  - SH1106 OLED displays animated face (5 emotions + blinking)
+  - Talking-mouth animation synced to speech
+  - Listening ears overlay during mic capture
+- 🦾 **Servo gestures** — nod, wave, shake, cheer, point
+- 🔊 **Speech output** via gTTS + PAM8403 amplifier
+- 📴 **Offline-first AI** — no paid API required
+- 🔐 **Privacy-friendly** — runs entirely on local hardware
+- 💾 **Persistent topic memory** — 50 topics saved across reboots
+- 🔁 **Auto-starts on boot** via crontab
 
 ---
 
 ## 🧱 System Architecture
 
-User (Voice/Text)
-↓
-Python Assistant
-├── Rule Engine
-├── Math / Topic Router
-├── Ollama (Phi-3-mini)
-├── Text-to-Speech
-└── Serial / WiFi Output
-↓
-ESP32
-├── LCD (Emotion)
-├── Servo (Gesture)
-└── Button (State Control)
-
+```
+Voice Input (MAX9814 → USB card RoboMic)
+        ↓
+Raspberry Pi 4
+  ├── find_mic_device_index()     — locates RoboMic by ALSA card name
+  ├── SpeechRecognition           — Google STT (en-IN)
+  ├── Rule Engine                 — greetings, identity, farewells
+  ├── Math Router                 — evaluates arithmetic expressions
+  ├── Topic Handler               — 90+ static topics with follow-up facts
+  ├── Memory (deque, JSON)        — persistent across reboots
+  ├── Ollama robo-fast            — AI fallback for unknown inputs
+  ├── gTTS → ffmpeg → aplay       — text-to-speech playback
+  └── pyserial (/dev/ttyACM0)     — serial commands to Arduino
+        ↓
+Arduino UNO R4 WiFi
+  ├── SH1106 OLED 128x64 (U8g2)  — animated face with blinking
+  └── 3× SG90 Servo               — head + two arms
+```
 
 ---
 
-## 🧰 Hardware Used
+## 🧰 Hardware
 
-- ESP32-C3 (or compatible ESP32)
-- 16x2 I2C LCD
-- SG90 Servo Motor
-- Push Button
-- Jumper wires
-- Speaker (optional, simulated in software)
+| Component | Details |
+|-----------|---------|
+| Raspberry Pi 4 | 4GB+ RAM recommended |
+| Arduino UNO R4 WiFi | USB serial to Pi (`/dev/ttyACM0`) |
+| SH1106 OLED 128×64 | I2C, address 0x3C |
+| SG90 Servo × 3 | Head (pin 9), Arm1 (pin 10), Arm2 (pin 11) |
+| MAX9814 Mic Module | 3.3V from Pi GPIO, GAIN → VDD (40dB fixed) |
+| USB Audio Card × 2 | Both GeneralPlus `1b3f:2008` — one mic, one speaker |
+| PAM8403 Amplifier | Connected to speaker USB card 3.5mm output |
+| Push Button | Arduino pin 7 |
+| Jumper wires | — |
+
+> ⚠️ Both USB audio cards are **physically identical** (same vendor/product ID). They are distinguished only by which physical USB port they occupy. **Never swap their ports** — udev rules pin them by port path.
 
 ---
 
 ## 🖥️ Software Stack
 
-| Component | Tech |
-|--------|------|
-| AI Model | Phi-3-mini (Ollama) |
-| Language | Python 3.10+ |
-| Speech-to-Text | Wit.ai |
-| Text-to-Speech | gTTS |
-| Hardware Control | PySerial |
-| Display | Adafruit LiquidCrystal |
-| OS | Ubuntu 22.04+ |
+| Component | Technology |
+|-----------|-----------|
+| AI Model | Ollama `robo-fast` (tinyllama base) |
+| Language | Python 3.11+ |
+| Speech-to-Text | Google STT via `speech_recognition` |
+| Text-to-Speech | gTTS + ffmpeg + aplay |
+| Hardware Control | pyserial |
+| Arduino Display | U8g2 library (SH1106) |
+| OS | Raspberry Pi OS 64-bit (Bookworm) |
 
 ---
 
-## 🚀 Getting Started
+## 📁 Repository Structure
 
-### 1️⃣ Clone Repository
-
-```bash
-git clone <https://github.com/Aaronidicula/hackathon_code_repos.git>
-cd Robotic_Companion_With_Personality
-
-2️⃣ Create Python Virtual Environment
-
-python3 -m venv venv
-source venv/bin/activate
-
-3️⃣ Install Dependencies
-
-pip install -r requirements.txt
-
-    ⚠️ Do NOT install flash-attn manually
-    Ollama already handles GPU acceleration.
-
-4️⃣ Install Ollama & Model
-
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull phi3:mini
-ollama serve
-
-Verify:
-
-ollama run phi3:mini
-
-5️⃣ Environment Variables
-
-Create your Wit.ai account and set:
-
-export WIT_AI_KEY="your_wit_ai_access_token"
-
-6️⃣ Connect ESP32
-
-Update serial port in Python code:
-
-SERIAL_PORT = "/dev/ttyUSB0"
-
-Common values:
-
-    /dev/ttyUSB0
-
-    /dev/ttyACM0
-
-7️⃣ Flash ESP32 Code
-
-Open the Arduino sketch from:
-
-/esp32/
-
-    Select ESP32-C3
-
-    Upload sketch
-
-    Open Serial Monitor @ 115200 baud
-
-8️⃣ Run the Assistant
-
-python main.py
-
-You can:
-
-    Speak using microphone 🎤
-
-    Press the button to activate listening
-
-    See emotions on LCD
-
-    Watch servo gestures
-
-    Hear spoken replies
-
-🧪 Example Interaction
-
-You: What is 1 + 1?
-Robot: 1 plus 1 equals 2 😊
-
-You: Tell me a joke
-Robot: Why did the robot go to school? To improve its byte! 🤖
-
-🛡️ Safety & Design Choices
-
-    Rule-based math and factual answers
-
-    No direct model output to hardware
-
-    AI fallback only for safe, open questions
-
-    Explicit intent routing
-
-    Child-friendly language prompts
-
-📁 Repository Structure
-
-Robotic_Companion_With_Personality/
+```
+RoboticCompanion/
 │
 ├── Python_Assistant/
-│   └── main.py
+│   ├── Testing_Stage/
+│   │   ├── assistant_tinyllama.py      ← ✅ Active script (currently under test)
+│   │   └── pishutdown_script.py        ← Safe Pi shutdown helper (imported by above)
+│   │
+│   ├── assistant_tinyllama             ← Previous version (text input only, no voice)
+│   ├── assistant_phi3_mini.py          ← Earlier prototype (Phi-3-mini, ESP32-era)
+│   ├── pishutdown_script.py            ← Pi shutdown helper
+│   ├── test_inference.py               ← Standalone model inference test
+│   ├── setup_environmentpi4.sh         ← ✅ One-shot setup script (run this first)
+│   └── Readme.md                       ← Quick-start note
 │
-├── esp32/
-│   └── esp32_robot.ino
+├── Controller_Arduino/
+│   ├── robotic_companion_arduino.ino   ← ✅ Main Arduino sketch (use this)
+│   └── Testing/
+│       └── robotic_companion_arduino/
+│           └── robotic_companion_arduino.ino  ← Testing copy
 │
-├── requirements.txt
-├── .gitignore
+├── Controller_ESP32/
+│   └── robotic_companion_esp32.ino     ← ESP32 prototype (archived, not maintained)
+│
+├── training/
+│   ├── data_creation_pipeline.py       ← Household assistant training data generator
+│   ├── advanced_finetuning.py          ← Fine-tuning pipeline
+│   ├── process_updated_data.py         ← Data processing + train/test split
+│   ├── training_data_updated_20260131_114134.csv
+│   └── training_data_updated_20260131_114134.json
+│
+├── start_robot.sh                      ← Boot wrapper (crontab @reboot)
+├── Modelfile                           ← Ollama robo-fast model definition (auto-generated by setup)
+├── requirements.txt                    ← Python dependencies
 └── README.md
+```
 
-🔮 Future Improvements
+> 📝 **Note on `assistant_tinyllama.py`:** The active script lives in `Testing_Stage/` while it is being developed and tested. Once testing is complete it will be copied to `Python_Assistant/assistant_tinyllama` (replacing the old text-input-only version) and `Testing_Stage/` will be cleared. `start_robot.sh` currently points to the `Testing_Stage/` path.
 
-    WiFi communication (ESP32 ↔ Python)
+---
 
-    Conversation memory
+## 🚀 Setup Guide
 
-    Emotion intensity levels
+### 1. Clone the repository
 
-    Camera + face detection
+```bash
+git clone https://github.com/Aaronidicula/RoboticCompanion.git
+cd RoboticCompanion
+```
 
-    On-device inference (MicroPython + SLM)
+### 2. Run the one-shot setup script
 
-    Mobile app controller
+This handles everything — venv, system packages, Ollama, model download, and `robo-fast` creation:
 
-🏁 Hackathon Pitch Summary
+```bash
+bash Python_Assistant/setup_environmentpi4.sh
+```
 
-    “A friendly robotic companion for children that listens, thinks, speaks, and reacts with emotion — built entirely with offline AI and affordable hardware.”
+The script will:
+- Verify architecture (aarch64 / Pi 4 required)
+- Set swap to 2GB
+- Install system packages (`ffmpeg`, `portaudio19-dev`, `alsa-utils`, etc.)
+- Install and start Ollama
+- Create the `rbcmp` Python virtual environment
+- Install all Python packages
+- Pull `tinyllama` and create the `robo-fast` model from `Modelfile`
+- Run a verification test
 
-📜 License
+After setup completes, activate the venv before running anything manually:
 
-MIT License
-Free to use, modify, and extend.
-🙌 Credits
+```bash
+source rbcmp/bin/activate
+```
 
-Built by Aaron
-Inspired by assistive robotics, education, and human-AI interaction.
+### 3. Install `flac` (required for Google STT)
+
+```bash
+sudo apt install flac -y
+```
+
+### 4. Flash the Arduino sketch
+
+Open `Controller_Arduino/robotic_companion_arduino.ino` in Arduino IDE:
+
+- Board: **Arduino UNO R4 WiFi**
+- Upload the sketch
+- Open Serial Monitor at **9600 baud** — you should see `READY`
+
+### 5. Set up udev rules to pin USB audio cards
+
+udev rules assign fixed ALSA names (`RoboMic` / `RoboSpk`) to each USB audio card by physical port, so card numbers never change across reboots.
+
+**Step 5a — Find the physical port path of each card:**
+
+With both cards plugged in, run:
+
+```bash
+udevadm info -a /dev/snd/controlC3 | grep KERNELS
+udevadm info -a /dev/snd/controlC4 | grep KERNELS
+```
+
+Look for the `KERNELS` value two levels up — it looks like `1-1.1` or `1-1.2`. Note which belongs to the mic card and which to the speaker card.
+
+**Step 5b — Create the udev rule file:**
+
+```bash
+sudo nano /etc/udev/rules.d/99-robo-audio.rules
+```
+
+Paste the following, replacing `1-1.1` and `1-1.2` with your actual values from Step 5a:
+
+```
+# Robotic Companion — pin USB audio cards to fixed names by physical port
+
+# Speaker card (PAM8403) — adjust KERNELS to match your port
+SUBSYSTEM=="sound", ACTION=="add", \
+  ATTRS{idVendor}=="1b3f", ATTRS{idProduct}=="2008", \
+  KERNELS=="1-1.1", \
+  ATTR{id}="RoboSpk"
+
+# Mic card (MAX9814) — adjust KERNELS to match your port
+SUBSYSTEM=="sound", ACTION=="add", \
+  ATTRS{idVendor}=="1b3f", ATTRS{idProduct}=="2008", \
+  KERNELS=="1-1.2", \
+  ATTR{id}="RoboMic"
+```
+
+```bash
+sudo udevadm control --reload-rules
+sudo reboot
+```
+
+**Step 5c — Verify after reboot:**
+
+```bash
+cat /proc/asound/cards
+# RoboSpk and RoboMic should appear as card names
+```
+
+### 6. Tune and save mic gain
+
+The USB chip resets to maximum gain (30dB) after every full power-off. Tune it once:
+
+```bash
+alsamixer -c RoboMic
+```
+
+- Press **F4** to switch to Capture view
+- Lower `Mic Capture Volume` to raw value **10** (~36%, 3dB) to prevent clipping
+- Press **Esc**
+
+Test while speaking — the VU bar should move without pinning at maximum:
+
+```bash
+arecord -D plughw:RoboMic,0 -f S16_LE -r 48000 -d 5 --vumeter=mono ~/speech_test.wav
+```
+
+**Save the state** (must be done before the first reboot):
+
+```bash
+alsactl --file ~/RoboticCompanion/mic_state_robobic.conf store RoboMic
+```
+
+### 7. Tune and save speaker volume
+
+```bash
+alsamixer -c RoboSpk
+```
+
+- Press **F5** to see all controls
+- Set `Speaker` to **27** out of 30
+- Press **Esc**
+
+**Save the state:**
+
+```bash
+alsactl --file ~/RoboticCompanion/spk_state_robospk.conf store RoboSpk
+```
+
+> ⚠️ If you retune either card at any point, re-run the matching `store` command above. The `.conf` files are what `start_robot.sh` restores on every boot. If they don't exist, the restore silently does nothing and the chip comes up at max gain.
+
+### 8. Set up auto-start on boot
+
+```bash
+crontab -e
+```
+
+Add this line:
+
+```
+@reboot /home/robotpi/RoboticCompanion/start_robot.sh
+```
+
+Make the script executable:
+
+```bash
+chmod +x ~/RoboticCompanion/start_robot.sh
+```
+
+The `start_robot.sh` script:
+- Waits 15 seconds for USB devices to settle
+- Waits for `RoboMic` to appear in `/proc/asound/cards`
+- Restores mixer state via `alsactl` then hard-sets gain via `amixer sset` (overrides chip hardware default)
+- Starts Ollama if not already running
+- Activates the venv and launches the assistant
+
+---
+
+## ▶️ Running manually
+
+```bash
+cd ~/RoboticCompanion
+source rbcmp/bin/activate
+python3 Python_Assistant/Testing_Stage/assistant_tinyllama.py
+```
+
+---
+
+## 🔌 Serial Protocol (Pi → Arduino)
+
+| Command | Effect |
+|---------|--------|
+| `LOADING` | Show animated loading screen |
+| `READY` | Switch to idle face |
+| `LISTEN_ON` | Show listening ears overlay |
+| `LISTEN_OFF` | Hide listening ears overlay |
+| `SPEAK_START` | Start talking-mouth animation |
+| `SPEAK_END` | Stop talking-mouth animation |
+| `happy` | Happy face + auto nod |
+| `excited` | Excited face + auto cheer |
+| `calm` | Calm face + auto idle |
+| `neutral` | Neutral face + auto idle |
+| `concerned` | Concerned face + auto nod |
+| `GESTURE:<name>` | One-off gesture (`wave` / `shake` / `point`) |
+| `test` | Full hardware test — all emotions + all gestures |
+| `END` | Return servos to rest, face to neutral |
+
+> ⚠️ Emotions are sent as **bare strings** (e.g. `happy`), **not** prefixed with `EMOTION:`.
+
+---
+
+## 🎤 Voice Commands
+
+| You say | Action |
+|---------|--------|
+| `hi` / `hello` | Greeting response + wave |
+| `what is your name` | Identity response |
+| `how are you` | Status response |
+| `bye` / `goodbye` | Farewell response + Pi shutdown |
+| `memory` | Print current memory topics to console |
+| `test` | Trigger full Arduino hardware test |
+| Any maths expression | Evaluated and spoken (e.g. `3+4`) |
+| Any known topic | Rule / topic response |
+| `tell me more` | Follow-up extra fact on last topic |
+| Anything else | Ollama AI fallback response |
+
+---
+
+## 🧪 Example Interactions
+
+```
+You:   What is 3 + 4?
+Robo:  3 plus 4 equals 7!
+
+You:   What is a black hole?
+Robo:  A black hole is a place in space where gravity is so strong
+       that nothing can escape it!
+
+You:   Tell me more
+Robo:  The nearest black hole to Earth is about 1000 light years
+       away so we are safe!
+
+You:   Tell me a joke
+Robo:  Why did the robot go to school? To improve its byte! Ha ha!
+```
+
+---
+
+## 🔧 Mic and Speaker Troubleshooting
+
+**Check card names are correct after reboot:**
+```bash
+cat /proc/asound/cards
+```
+
+**Check mic gain (should be Capture 10, 3dB):**
+```bash
+amixer -c RoboMic sget Mic
+```
+
+**Check speaker gain (should be 27/30):**
+```bash
+amixer -c RoboSpk sget Speaker
+```
+
+**Record a test clip with live VU meter:**
+```bash
+arecord -D plughw:RoboMic,0 -f S16_LE -r 48000 -d 5 --vumeter=mono ~/test.wav
+```
+
+**Analyse a WAV file for clipping and RMS:**
+```python
+import wave, numpy as np
+with wave.open('test.wav', 'rb') as f:
+    data = np.frombuffer(f.readframes(f.getnframes()), dtype=np.int16)
+rms = np.sqrt(np.mean(data.astype(np.float64)**2)) / 32768
+clipping = np.sum(np.abs(data) >= 32760) / len(data) * 100
+print(f"RMS: {rms:.4f}  Clipping: {clipping:.2f}%")
+# Target: RMS 0.15–0.35 during speech, Clipping 0%
+```
+
+**Re-save mixer state after retuning:**
+```bash
+alsactl --file ~/RoboticCompanion/mic_state_robobic.conf store RoboMic
+alsactl --file ~/RoboticCompanion/spk_state_robospk.conf store RoboSpk
+```
+
+---
+
+## 🛡️ Safety and Design
+
+- Rule-based math and factual answers ensure accuracy for children
+- AI fallback only for open-ended questions not covered by rules
+- Child-friendly language enforced in all Ollama prompts
+- No data stored externally (Google STT sends audio to Google — replace with Whisper for full offline)
+
+---
+
+## 🔮 Future Improvements
+
+- WiFi communication between Pi and Arduino (replace USB serial)
+- Multi-turn conversation context
+- Camera + face detection for child tracking
+- Emotion intensity levels (subtle vs. exaggerated)
+- On-device STT (Whisper) to remove Google API dependency
+- Mobile app controller
+
+---
+
+## 📜 License
+
+MIT License — free to use, modify, and extend.
+
+---
+
+## 🙌 Credits
+
+Built by **Aaron**
+Inspired by assistive robotics, children's education, and human-AI interaction.
