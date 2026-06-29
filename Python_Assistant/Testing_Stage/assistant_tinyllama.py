@@ -25,6 +25,11 @@ import random
 import json
 import subprocess
 from collections import deque
+import pishutdown_script
+
+def pi_shutdown():
+    print("Parent Script Triggered Shutdown")
+    pishutdown_script.trigger_system_halt()
 
 # ── SUPPRESS JACK + ALSA WARNINGS ────────────────────
 os.environ['JACK_NO_AUDIO_RESERVATION'] = '1'
@@ -43,10 +48,26 @@ asound.snd_lib_error_set_handler(c_error_handler)
 import speech_recognition as sr
 import pyaudio
 
-def find_mic_device_index(name_fragment: str = "USB Audio") -> int:
-    """Find the PyAudio device index whose name contains name_fragment.
-    Returns the FIRST input-capable device matching the fragment.
-    Prints all devices so you can see what names are available."""
+def find_mic_device_index() -> int:
+    """Find PyAudio index by matching the ALSA card number of RoboMic."""
+    # Step 1: find which card number RoboMic is
+    mic_card_num = None
+    try:
+        with open("/proc/asound/cards") as f:
+            for line in f:
+                if "RoboMic" in line:
+                    mic_card_num = int(line.strip().split()[0])
+                    break
+    except Exception as e:
+        print(f"⚠️  Could not read /proc/asound/cards: {e}")
+
+    if mic_card_num is None:
+        print("⚠️  RoboMic not found in /proc/asound/cards — udev rule may not have applied!")
+        return 0
+
+    print(f"   RoboMic = ALSA card {mic_card_num}")
+
+    # Step 2: find the PyAudio device index whose name contains hw:<card_num>
     p = pyaudio.PyAudio()
     found = None
     print("🎤 Available audio input devices:")
@@ -54,16 +75,18 @@ def find_mic_device_index(name_fragment: str = "USB Audio") -> int:
         info = p.get_device_info_by_index(i)
         if info.get("maxInputChannels", 0) > 0:
             print(f"   [{i}] {info['name']}")
-            if found is None and name_fragment.lower() in info['name'].lower():
+            if f"hw:{mic_card_num}," in info['name']:
                 found = i
     p.terminate()
+
     if found is None:
-        print(f"⚠️  No input device matching '{name_fragment}' found — falling back to default (index 0)")
+        print(f"⚠️  No PyAudio input device found matching hw:{mic_card_num},")
         return 0
-    print(f"✅ Using mic device index {found}")
+
+    print(f"✅ Mic device: index {found}  (RoboMic = hw:{mic_card_num},0)")
     return found
 
-MIC_DEVICE_INDEX = find_mic_device_index("USB Audio")
+MIC_DEVICE_INDEX = find_mic_device_index()
 import ollama
 import serial
 from gtts import gTTS
@@ -210,7 +233,7 @@ def speak_text(text: str):
             "-ar 48000 -ac 1 /tmp/response_clean.wav "
             "2>/dev/null"
         )
-        os.system("aplay -D plughw:3,0 /tmp/response_clean.wav 2>/dev/null")
+        os.system("aplay -D plughw:RoboSpk,0 /tmp/response_clean.wav 2>/dev/null")
     except Exception as e:
         print(f"TTS error: {e}")
 
@@ -767,7 +790,9 @@ while True:
             print("👋 Shutting down...")
             say("Goodbye! See you soon!")
             serial_send("END")
-            break
+            if ser and ser.is_open:
+                ser.close()
+            pi_shutdown()
 
         print(f"You: {user_input}")
 
